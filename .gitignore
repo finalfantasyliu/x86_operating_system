@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Thumbnails
+Icon?
+ehthumbs.db
+Thumbs.db
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Build output
+build/
+*.o
+*.obj
+*.elf
+*.bin
+*.img
+*.iso
+*.map
+*.lst
+
+# Logs
+*.log
