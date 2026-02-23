@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug OS (QEMU + GDB)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/os.elf",
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "/opt/homebrew/bin/x86_64-elf-gdb",
+            "miDebuggerServerAddress": "127.0.0.1:1234",
+            "stopAtConnect": true,
+            "preLaunchTask": "launch-qemu",
+            "setupCommands": [
+                {
+                    "description": "Set disassembly flavor to Intel",
+                    "text": "set disassembly-flavor intel",
+                    "ignoreFailures": false
+                }
+            ]
+        }
+    ]
+}
