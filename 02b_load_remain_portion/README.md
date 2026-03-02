@@ -1,273 +1,734 @@
-# 02b - 80386 Segment-Level Protection 完全解析
+# 02b - 載入剩餘磁區並進入 Protected Mode 完全解析
 
-從 Real Mode 進入 Protected Mode 後，CPU 會自動對每一次記憶體存取做保護檢查。本篇從零開始，由淺入深解釋 Intel 386 的 Segment-Level Protection 機制。
-
-參考來源：[Intel 80386 Programmer's Reference Manual - Section 6.3](https://www.scs.stanford.edu/nyu/04fa/lab/i386/s06_03.htm)
+本篇涵蓋從 bootloader 載入磁區、進入 Protected Mode 到 80386 Segment-Level Protection 的所有知識點。
 
 ---
 
 ## Table of Contents
 
-1. [為什麼需要保護？](#1-為什麼需要保護)
-2. [Segment Descriptor（段描述符）](#2-segment-descriptor段描述符)
-3. [Descriptor Table（描述符表格）](#3-descriptor-table描述符表格)
-4. [Privilege Level（權限等級）](#4-privilege-level權限等級)
-5. [五種保護機制詳解](#5-五種保護機制詳解)
-6. [Gate Descriptor（閘門描述符）](#6-gate-descriptor閘門描述符)
-7. [Stack Switching（堆疊切換）](#7-stack-switching堆疊切換)
-8. [Instruction Restriction（指令限制）](#8-instruction-restriction指令限制)
-9. [Pointer Validation Instructions（指標驗證指令）](#9-pointer-validation-instructions指標驗證指令)
-10. [完整的大圖](#10-完整的大圖)
+**Part 1: 組合語言基礎**
+1. [Segment Register 為什麼不能直接賦值？](#1-segment-register-為什麼不能直接賦值)
+2. [Segment:Offset 配對總整理](#2-segmentoffset-配對總整理)
+3. [.S 檔案中什麼會變成機器碼？](#3-s-檔案中什麼會變成機器碼)
+4. [Assembly 中的 Label 是什麼？](#4-assembly-中的-label-是什麼)
+5. [.code16 / .code32 的作用範圍](#5-code16--code32-的作用範圍)
+6. [.org / .byte 的位置與程式碼組織](#6-org--byte-的位置與程式碼組織)
+
+**Part 2: BIOS 中斷與磁碟讀取**
+7. [BIOS 中斷的 AH 慣例](#7-bios-中斷的-ah-慣例)
+8. [INT 0x13 磁碟讀取詳解](#8-int-0x13-磁碟讀取詳解)
+
+**Part 3: CPU 演進與模式切換**
+9. [x86 CPU 演進史：8086 → 286 → 386 → 現代](#9-x86-cpu-演進史8086--286--386--現代)
+10. [Real Mode → Protected Mode → Long Mode](#10-real-mode--protected-mode--long-mode)
+11. [UEFI 在開機流程中的角色](#11-uefi-在開機流程中的角色)
+12. [如何進入 Protected Mode](#12-如何進入-protected-mode)
+13. [lmsw 與 mov cr0 的差異](#13-lmsw-與-mov-cr0-的差異)
+
+**Part 4: Segment Descriptor 與 GDT**
+14. [Segment Descriptor 結構與歷史包袱](#14-segment-descriptor-結構與歷史包袱)
+15. [286 的 16-bit Limit 為什麼合理？](#15-286-的-16-bit-limit-為什麼合理)
+16. [4GB 是每個 Segment 的上限還是總共的？](#16-4gb-是每個-segment-的上限還是總共的)
+17. [GDT、LDT 與 8192 Descriptors](#17-gdtldt-與-8192-descriptors)
+18. [GDT Descriptor（gdt_desc）的格式解析](#18-gdt-descriptorgdt_desc的格式解析)
+19. [Protected Mode 中 CS 是 Selector，那 Offset 是什麼？](#19-protected-mode-中-cs-是-selector那-offset-是什麼)
+
+**Part 5: Segment-Level Protection**
+20. [為什麼需要保護？](#20-為什麼需要保護)
+21. [Type 欄位詳解（S、E、ED/C、R/W、A）](#21-type-欄位詳解sedc-rw-a)
+22. [System Descriptor（S=0）的用途](#22-system-descriptors0的用途)
+23. [Privilege Level：CPL、DPL、RPL](#23-privilege-levelcpldplrpl)
+24. [五種保護機制](#24-五種保護機制)
+25. [Gate Descriptor（閘門描述符）](#25-gate-descriptor閘門描述符)
+26. [Conforming Code Segment 到底是什麼？](#26-conforming-code-segment-到底是什麼)
+27. [Segment Register 的類型限制](#27-segment-register-的類型限制)
+28. [指令執行時的完整流程](#28-指令執行時的完整流程)
+
+**Part 6: Stack 與 TSS**
+29. [SS、ESP、EBP 的關係](#29-ssespebp-的關係)
+30. [Stack Switching 與 TSS](#30-stack-switching-與-tss)
+
+**Part 7: 現代 OS 還用這些嗎？**
+31. [現代 OS 中哪些機制還在用？](#31-現代-os-中哪些機制還在用)
+
+**Part 8: 參考資料**
+32. [References](#32-references)
 
 ---
 
-## 1. 為什麼需要保護？
-
-### 1.1 沒有保護的世界：Real Mode
-
-在 Real Mode 下，任何程式都可以存取任何記憶體位址，沒有任何限制：
-
-```
-程式 A 想寫 0x1234 → OK
-程式 B 想寫 0x1234 → OK，A 的資料被蓋掉了
-惡意程式想改 OS 的記憶體 → OK，整台電腦被搞爛
-惡意程式想執行特權指令（例如關掉 CPU）→ OK，電腦直接當掉
-```
-
-這在早期只跑一個程式的電腦（如 DOS）還可以接受，但現代 OS 要同時跑很多程式，如果每個程式都能任意存取所有記憶體，那就是災難。
-
-### 1.2 Protected Mode 的目標
-
-Intel 386 引入 Protected Mode，讓 CPU 硬體自動做保護。每一次記憶體存取，CPU 都會自動檢查：
-
-1. **你有權限嗎？**（一般程式不能碰 OS 的記憶體）
-2. **你超出範圍了嗎？**（不能存取超過這塊記憶體的大小）
-3. **你用對方式了嗎？**（不能把唯讀的當可寫的、不能把資料當程式碼執行）
-4. **你走對入口了嗎？**（呼叫 OS 功能必須走指定入口，不能亂跳）
-5. **你用了不該用的指令嗎？**（某些指令只有 OS 能用）
-
-任何一項檢查不通過，CPU 就立刻觸發例外（exception），程式被強制停下來。這一切都是硬體自動做的，不需要 OS 用軟體去慢慢檢查。
+# Part 1: 組合語言基礎
 
 ---
 
-## 2. Segment Descriptor（段描述符）
+## 1. Segment Register 為什麼不能直接賦值？
 
-### 2.1 Real Mode vs Protected Mode 的 Segment
-
-Real Mode：
+### 問題
 
 ```asm
-mov ds, 0x1000    ; DS 直接就是一個「基底位址的簡寫」
-; 存取 [ds:0x0050] = 0x1000 × 16 + 0x0050 = 0x10050
+mov ds, 0x0000    ; ❌ 不合法！
+mov ds, ax        ; ✅ 必須透過 general-purpose register
 ```
 
-DS 裡面的值直接參與位址計算，非常簡單，但沒有任何保護資訊。CPU 不知道這塊記憶體有多大、是程式碼還是資料、誰能存取。
+為什麼 segment register 不能直接用 immediate value 賦值？一定要用 AX 嗎？
 
-Protected Mode 完全不一樣：
+### 答案
+
+這是 **CPU ISA（Instruction Set Architecture）的設計**。Intel 從 8086 開始就沒有定義 `mov segment_register, immediate` 這個 opcode。CPU 只認得 `mov segment_register, r/m16`（從暫存器或記憶體載入）。
+
+不是只能用 AX，**任何 16-bit general-purpose register 都可以**：
 
 ```asm
-mov ds, 0x10      ; 這不是位址！這是一個「索引」（叫 selector）
-; CPU 拿 0x10 去一個表格（GDT）裡查找
-; 查到的 entry 叫做「Segment Descriptor」
-; 裡面記錄了：基底位址、大小、類型、權限...全部資訊
+mov ax, 0x1000
+mov ds, ax        ; ✅ 用 AX
+
+mov bx, 0x1000
+mov ds, bx        ; ✅ 用 BX
+
+mov cx, 0x1000
+mov ds, cx        ; ✅ 用 CX
+
+mov dx, 0x1000
+mov ds, dx        ; ✅ 用 DX
 ```
 
-### 2.2 Segment Descriptor 的結構
+也可以從記憶體載入：
 
-Segment Descriptor 是一個 8 bytes（64 bits）的資料結構，描述一塊記憶體的所有資訊：
+```asm
+mov ds, [some_memory_location]    ; ✅ 從記憶體載入
+```
+
+用 AX 只是慣例，因為 AX 是最常用的累加器。
+
+> **Reference**: Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 2, "MOV" instruction:
+> "MOV Sreg, r/m16 — Move r/m16 to segment register."
+> 沒有 "MOV Sreg, imm16" 的 encoding。
+
+---
+
+## 2. Segment:Offset 配對總整理
+
+### 預設配對
+
+| Segment Register | 預設 Offset Register | 用途 |
+|---|---|---|
+| **CS** | **IP/EIP** | 指令提取（Instruction Fetch）— CPU 自動使用，不能手動 `mov cs, xx` |
+| **SS** | **SP/ESP, BP/EBP** | 堆疊操作 — `push`、`pop`、`call`、`ret` 及 `[bp+xx]` 定址 |
+| **DS** | **SI, BX, DI** 及大部分定址 | 一般資料存取 — `mov ax, [bx+4]`、`mov [si], al` 等 |
+| **ES** | **DI**（字串指令目的地） | `movsb`、`stosb`、`scasb` 等字串指令的目的地 |
+| **FS** | 任意 | 額外的資料段（386 新增），現代 OS 常用來指向 thread-local storage |
+| **GS** | 任意 | 額外的資料段（386 新增），Linux kernel 用它指向 per-CPU data |
+
+### 重要釐清：ES:BX vs ES:DI
+
+ES:DI 是**字串指令**（如 `movsb`、`stosb`）的硬性規定，由 CPU 微架構決定。
+
+但 BIOS `int 0x13` 讀取磁碟時使用的是 **ES:BX**，這是 **BIOS 的軟體慣例**，不是 CPU 硬體規定：
+
+```asm
+; BIOS int 0x13, AH=02h — 讀取磁碟
+; ES:BX = 資料載入的目標位址（BIOS 的約定）
+mov bx, _start_32    ; offset
+; ES 已經設為 0
+int 0x13             ; BIOS 讀取到 ES:BX = 0x0000:_start_32
+```
+
+> **Reference**: Ralph Brown's Interrupt List, INT 13h AH=02h:
+> "ES:BX -> buffer for data"
+
+---
+
+## 3. .S 檔案中什麼會變成機器碼？
+
+### 會變成實際 binary 內容的
+
+| 類別 | 範例 | 說明 |
+|---|---|---|
+| **CPU 指令** | `mov ax, 0`, `jmp label`, `int 0x13` | 組譯為機器碼 |
+| **資料指示** | `.byte 0x55, 0xAA`, `.word 0x1234`, `.long`, `.string`, `.fill` | 直接放入 binary |
+| **對齊/填充** | `.org 0x1FE, 0x90` | 用指定值填充到指定位置 |
+
+### 不會變成 binary 內容的
+
+| 類別 | 範例 | 說明 |
+|---|---|---|
+| **Label** | `_start:`, `read_self_all:` | 只是位址的別名，由 assembler/linker 解析 |
+| **模式指示** | `.code16`, `.code32` | 告訴 assembler 產生哪種位元寬度的指令 |
+| **段落指示** | `.text`, `.data`, `.bss` | 告訴 assembler 把後續內容放在哪個 section |
+| **符號指示** | `.global _start` | 告訴 linker 這個符號是全域可見的 |
+| **語法指示** | `.intel_syntax noprefix` | 告訴 assembler 使用 Intel 語法 |
+| **註解** | `// 這是註解`, `/* */` | 完全忽略 |
+| **預處理** | `#include "os.h"`, `#define` | gcc preprocessor 處理，assembler 看不到 |
+
+### 以 start.S 為例
+
+```asm
+#include "os.h"              ; ← 預處理器處理，不進 binary
+.global _start               ; ← linker 指示，不進 binary
+.code16                      ; ← assembler 指示，不進 binary
+.intel_syntax noprefix       ; ← assembler 指示，不進 binary
+.text                        ; ← section 指示，不進 binary
+_start:                      ; ← label，不進 binary（但代表此處位址 0x7C00）
+    xor     ax, ax           ; ← ✅ 機器碼：31 C0
+    mov     ds, ax           ; ← ✅ 機器碼：8E D8
+```
+
+---
+
+## 4. Assembly 中的 Label 是什麼？
+
+Label 就是**位址的別名**。它本身不產生任何機器碼，只是在組譯/連結時被解析為一個數值（位址）。
+
+```asm
+; 假設 linker script 指定 . = 0x7C00
+_start:                   ; _start = 0x7C00
+    xor ax, ax            ; 2 bytes
+    mov ds, ax            ; 2 bytes
+    ...
+_start_32:                ; _start_32 = 0x7C00 + 512 = 0x7E00（在 boot signature 之後）
+```
+
+所以當你寫：
+
+```asm
+mov bx, _start_32
+```
+
+assembler/linker 會把 `_start_32` 替換為它的實際位址值（例如 `0x7E00`），就等同於：
+
+```asm
+mov bx, 0x7E00
+```
+
+在 flat model（base = 0）下，label 的值 = offset = 最終線性位址。
+
+---
+
+## 5. .code16 / .code32 的作用範圍
+
+`.code16` 和 `.code32` 的作用範圍是**從它出現的位置到下一個 `.code16` 或 `.code32` 為止**。
+
+```asm
+.code16                    ; ← 從這裡開始，所有指令產生 16-bit 機器碼
+_start:
+    xor ax, ax             ; 16-bit 指令
+    mov ds, ax             ; 16-bit 指令
+    ...
+    jmp KERNEL_CODE_SEG:_start_32
+
+    .org 0x1FE, 0x90
+    .byte 0x55, 0xAA
+
+    .code32                ; ← 從這裡開始，所有指令產生 32-bit 機器碼
+_start_32:
+    jmp .                  ; 32-bit 指令
+```
+
+它只影響 **assembler 產生的機器碼編碼方式**，不會在 binary 裡產生任何內容。
+
+---
+
+## 6. .org / .byte 的位置與程式碼組織
+
+### 問題
+
+`.org 0x1FE` 和 `.byte 0x55, 0xAA` 卡在 `enter_protected_mode` 和 `.code32` 之間，讀起來很混亂。有沒有更好的寫法？
+
+### 方法一：用 Section 分離
+
+```asm
+.section .boot_sig, "a"    ; 獨立的 section
+    .org 0x1FE, 0x90
+    .byte 0x55, 0xAA
+
+.section .text32, "ax"     ; 32-bit code 獨立 section
+    .code32
+_start_32:
+    jmp .
+```
+
+然後在 linker script 裡控制排列順序：
+
+```ld
+.text : {
+    *(.text)
+    *(.boot_sig)
+    *(.text32)
+}
+```
+
+### 方法二：用獨立的 .S 檔案
 
 ```
-一個 Segment Descriptor（8 bytes = 64 bits）：
+source/
+├── boot16.S     ← 16-bit code + boot signature
+├── start32.S    ← 32-bit code
+├── os.c         ← GDT table
+└── os.h         ← 共用常數
+```
 
+### 方法三：用清晰的註解區隔（最簡單）
+
+```asm
+/* ============================================================
+ * Boot Signature — 必須在 offset 0x1FE
+ * ============================================================ */
+    .org 0x1FE, 0x90
+    .byte 0x55, 0xAA
+
+/* ============================================================
+ * 32-bit Protected Mode Code — 從第二個 sector 開始
+ * ============================================================ */
+    .code32
+    .text
+_start_32:
+    jmp .
+```
+
+---
+
+# Part 2: BIOS 中斷與磁碟讀取
+
+---
+
+## 7. BIOS 中斷的 AH 慣例
+
+BIOS 中斷（`int` 指令）使用 **AH 暫存器** 來選擇功能編號。每個中斷號碼是一個「服務類別」，AH 是「該類別中的具體功能」。
+
+### INT 0x10 — 螢幕服務
+
+| AH | 功能 | 參數 |
+|---|---|---|
+| 0x00 | 設定螢幕模式 | AL = 模式編號 |
+| 0x0E | Teletype 輸出（印一個字元） | AL = 字元, BH = page |
+| 0x13 | 寫字串 | ES:BP = 字串, CX = 長度 |
+
+### INT 0x13 — 磁碟服務
+
+| AH | 功能 | 參數 |
+|---|---|---|
+| 0x00 | 重置磁碟系統 | DL = 磁碟編號 |
+| 0x02 | 讀取磁區 | AL = 磁區數, CH = cylinder, CL = sector, DH = head, DL = drive, ES:BX = buffer |
+| 0x03 | 寫入磁區 | 同上 |
+| 0x08 | 取得磁碟參數 | DL = drive |
+
+### 為什麼用 AH 而不是其他暫存器？
+
+這是 IBM PC BIOS 從 1981 年定下的慣例。AX 暫存器可以拆成 AH（高 8 位）和 AL（低 8 位），AH 選功能，AL 放附加參數，一個暫存器完成兩件事。
+
+---
+
+## 8. INT 0x13 磁碟讀取詳解
+
+### start.S 中的磁碟讀取程式碼
+
+```asm
+read_self_all:
+    mov bx, _start_32    ; ES:BX = 載入目標位址（0x0000:0x7E00）
+    mov cx, 0x2          ; CH=0（cylinder 0），CL=2（從 sector 2 開始）
+    mov ax, 0x240        ; AH=02（讀取功能），AL=0x40（讀 64 個 sectors = 32KB）
+    mov dx, 0x80         ; DH=0（head 0），DL=0x80（第一顆硬碟）
+    int 0x13
+    jc read_self_all     ; CF=1 表示失敗，重試
+```
+
+### CHS 定址（Cylinder-Head-Sector）
+
+```
+硬碟結構：
+
+      ┌──── 圓盤 (Platter) ────┐
+      │                        │
+      │   Track 0 ─────╮      │  ← 最外圈
+      │   Track 1 ───╮ │      │
+      │   Track 2 ─╮ │ │      │
+      │            ▼ ▼ ▼       │  ← Head 0（正面）
+      │   ┌─┬─┬─┬─┬─┐         │
+      │   │ │ │ │ │ │  sectors │  ← 每個 track 分成多個 sector
+      │   └─┴─┴─┴─┴─┘         │
+      │            ▲ ▲ ▲       │  ← Head 1（反面）
+      │   Track 0 ─╯ │ │      │
+      │   Track 1 ───╯ │      │
+      │   Track 2 ─────╯      │
+      └────────────────────────┘
+
+Cylinder = 正面 Track N + 反面 Track N（同一半徑的所有 track）
+```
+
+- **Cylinder（磁柱）**：同一半徑上所有磁面的 track 集合（包含正面和反面）
+- **Head（磁頭）**：選哪一面（0 = 正面，1 = 反面）
+- **Sector（磁區）**：track 上的第幾個區塊（從 **1** 開始，不是 0）
+- 每個 sector = **512 bytes**
+
+### 為什麼從 sector 2 開始？
+
+Sector 1 就是 boot sector（已經被 BIOS 載入到 0x7C00 了），所以剩餘的 code 從 sector 2 開始讀取。
+
+### AL = 0x40（64 sectors）會跨 track 嗎？
+
+如果一個 track 只有 63 個 sector（常見設定），讀 64 個 sector 理論上會跨 track。在真實硬體的舊 BIOS 上可能出問題，但在 QEMU 模擬環境中可以正常運作。
+
+### 如果 ES 不是 0 會怎樣？
+
+```
+載入位址 = ES × 16 + BX
+```
+
+如果 ES = 0x1000、BX = 0x7E00：
+
+```
+載入位址 = 0x1000 × 16 + 0x7E00 = 0x10000 + 0x7E00 = 0x17E00
+```
+
+資料會載入到錯誤的位址，後面跳轉到 `_start_32`（0x7E00）時，那裡沒有有效的 code，CPU 就當掉了。所以 `_start` 開頭要先把 ES 清零。
+
+---
+
+# Part 3: CPU 演進與模式切換
+
+---
+
+## 9. x86 CPU 演進史：8086 → 286 → 386 → 現代
+
+### 8086（1978）— Real Mode 唯一模式
+
+| 項目 | 規格 |
+|---|---|
+| 位元寬度 | 16-bit |
+| 定址空間 | 1MB（20-bit address bus） |
+| 模式 | Real Mode（唯一模式） |
+| Segment 機制 | segment × 16 + offset，無保護 |
+
+> **Reference**: Intel iAPX 86/88 User's Manual (1981):
+> "The 8086 provides a 20-bit address to memory which locates any byte in a 1 megabyte memory space."
+
+### 80286（1982）— 第一代 Protected Mode
+
+| 項目 | 規格 |
+|---|---|
+| 位元寬度 | 16-bit |
+| 定址空間 | 16MB（24-bit address bus） |
+| 新增模式 | Protected Mode |
+| Segment Descriptor | 6 bytes（base 24-bit，limit 16-bit） |
+| 重大缺陷 | **進入 Protected Mode 後無法返回 Real Mode**（需重啟 CPU） |
+
+> **Reference**: Intel 80286 Programmer's Reference Manual (1985):
+> "The 80286 has two modes of operation: real address mode and protected virtual address mode."
+> "The 80286 supports 16 megabytes of physical memory space and 1 gigabyte of virtual address space per task."
+
+286 的 Descriptor 是 6 bytes，byte 6 和 byte 7 被標記為 "reserved, must be 0"。386 後來把新增的 bits 就塞進這兩個 reserved bytes，所以 386 的 descriptor 格式看起來很亂——這是歷史包袱。
+
+### 80386（1985）— 32-bit Protected Mode + Paging
+
+| 項目 | 規格 |
+|---|---|
+| 位元寬度 | 32-bit |
+| 定址空間 | 4GB（32-bit address bus） |
+| 新增功能 | 32-bit Protected Mode、Paging、V86 Mode |
+| Segment Descriptor | 8 bytes（base 32-bit，limit 20-bit + G bit） |
+| 修復缺陷 | 可以從 Protected Mode 返回 Real Mode |
+
+> **Reference**: Intel 80386 Programmer's Reference Manual (1986), Section 2.1:
+> "The 80386 has three modes of operation: Protected Mode, Real-Address Mode, and Virtual 8086 Mode."
+
+> **Reference**: Intel 80386 Manual, Section 2.5:
+> "In protected mode, the 386 can address up to 4 gigabytes of physical memory and 64 terabytes of virtual memory."
+
+### x86-64 / AMD64（2003）— Long Mode
+
+| 項目 | 規格 |
+|---|---|
+| 位元寬度 | 64-bit |
+| 虛擬定址 | 256TB（48-bit，現已擴展到 57-bit） |
+| 實體定址 | 依 CPU 實作，通常 40-52 bit |
+| Segmentation | **幾乎廢除**，base 強制為 0（FS、GS 除外） |
+
+> **Reference**: AMD64 Architecture Programmer's Manual, Volume 2, Section 1.2:
+> "In 64-bit mode, segmentation is disabled. The segment base is treated as zero."
+
+---
+
+## 10. Real Mode → Protected Mode → Long Mode
+
+```
+開機
+  │
+  ▼
+Real Mode（16-bit）
+  │ CPU 上電時的預設模式
+  │ 沒有任何保護
+  │ 最大 1MB 記憶體
+  │
+  │ ← 設定 GDT → 設定 CR0.PE = 1 → Far Jump
+  ▼
+Protected Mode（32-bit）
+  │ 有 segment-level protection
+  │ 可用 4GB 記憶體
+  │ 可啟用 paging
+  │
+  │ ← 啟用 PAE → 設定 page tables → 設定 CR0.PG、EFER.LME → Far Jump
+  ▼
+Long Mode（64-bit）
+  │ 虛擬定址 256TB+
+  │ segmentation 幾乎廢除
+  │ paging 必須啟用
+```
+
+Protected Mode 並沒有被「捨棄」或「跳過」。即使目標是 Long Mode，CPU 仍然必須先經過 Protected Mode（至少短暫地）。Long Mode 是 Protected Mode 的**擴展**，不是替代。
+
+---
+
+## 11. UEFI 在開機流程中的角色
+
+### 傳統 BIOS 開機
+
+```
+CPU 上電 → Real Mode
+  → BIOS 載入 boot sector 到 0x7C00
+  → bootloader 自己建 GDT
+  → bootloader 自己進 Protected Mode
+  → bootloader 自己進 Long Mode
+  → 跳到 kernel
+```
+
+你需要自己寫所有模式轉換的 code。這就是我們這個專案在做的事。
+
+### UEFI 開機
+
+```
+CPU 上電 → Real Mode
+  → UEFI firmware 自己完成 Real → Protected → Long Mode
+  → UEFI firmware 建立好 page tables、GDT、IDT
+  → 載入 EFI application（.efi 檔案）
+  → 已經在 64-bit Long Mode，有 flat memory model
+  → 呼叫 EFI application 的 entry point
+```
+
+UEFI firmware 把所有骯髒的模式切換工作都做完了。EFI application 拿到的是一個已經設定好的 64-bit 環境，還有 UEFI 提供的服務函數（Boot Services）可以呼叫。
+
+---
+
+## 12. 如何進入 Protected Mode
+
+進入 Protected Mode 需要 4 個步驟（Intel 規定的）：
+
+### Step 1: cli — 關閉中斷
+
+```asm
+cli
+```
+
+為什麼？因為 Real Mode 的中斷向量表（IVT）在 0x0000:0x0000，裡面的 handler 都是 16-bit Real Mode code。如果在切換到 Protected Mode 的過程中發生中斷，CPU 會用 Real Mode 的方式去處理中斷，但 CPU 此時已經處於 Protected Mode，造成整個系統崩潰。
+
+### Step 2: lgdt — 載入 GDT
+
+```asm
+lgdt [gdt_desc]
+```
+
+告訴 CPU GDT 在哪裡、有多大。`gdt_desc` 是一個 6-byte 的資料結構：
+
+```
+gdt_desc:
+.word (256*8) - 1    ; 2 bytes: GDT 的 limit
+.long gdt_table      ; 4 bytes: GDT 的 base address
+```
+
+### Step 3: 設定 CR0.PE = 1
+
+```asm
+mov eax, 1
+lmsw eax
+```
+
+CR0 暫存器的 bit 0 是 PE（Protection Enable）。將它設為 1，CPU 就進入 Protected Mode。
+
+### Step 4: Far Jump — 刷新 Pipeline
+
+```asm
+jmp KERNEL_CODE_SEG:_start_32
+```
+
+為什麼需要 far jump？兩個原因：
+
+1. **Pipeline Flush**：CPU 的 pipeline 裡可能還有用 Real Mode 方式解碼的指令。far jump 強制 CPU 清空 pipeline，重新用 Protected Mode 方式取指令。
+2. **載入 CS**：far jump 會把新的 selector（`KERNEL_CODE_SEG` = 0x08）載入 CS，CPU 會去 GDT 查找對應的 descriptor，把 base、limit、type 等資訊 cache 到 CS 的隱藏部分。
+
+> **Reference**: Intel 80386 Manual, Section 10.3 "Switching to Protected Mode":
+> "The instructions that immediately follow the MOV CR0 instruction should be a JMP or CALL."
+
+> **注意**：far jump 的語法是 `jmp segment:offset`，不是 `jmp offset:segment`。
+
+---
+
+## 13. lmsw 與 mov cr0 的差異
+
+### lmsw（Load Machine Status Word）
+
+```asm
+mov eax, 1
+lmsw eax      ; 只修改 CR0 的低 16 bits
+```
+
+`lmsw` 是 286 時代的指令。它只能修改 CR0 的低 16 bits（也就是 286 的 MSW — Machine Status Word）。
+
+**特別限制**：一旦用 `lmsw` 把 PE bit 設為 1，你**不能用 `lmsw` 把它清回 0**。這是 286 設計的遺留——286 無法返回 Real Mode。
+
+### mov cr0（386 新增）
+
+```asm
+mov eax, cr0    ; 先讀出 CR0 的完整值
+or eax, 1       ; 設定 PE bit
+mov cr0, eax    ; 寫回
+```
+
+`mov cr0` 是 386 新增的，可以修改 CR0 的全部 32 bits，包括：
+
+| Bit | 名稱 | 說明 |
+|---|---|---|
+| 0 | PE | Protection Enable |
+| 16 | WP | Write Protect（Ring 0 也不能寫 read-only page） |
+| 31 | PG | Paging Enable |
+
+用 `mov cr0` 可以把 PE 清回 0（返回 Real Mode），這是 286 做不到的。
+
+我們的 code 用 `lmsw` 是因為只需要設定 PE bit，而且只是進入 Protected Mode（不需要返回），所以 `lmsw` 就夠了。如果之後要啟用 Paging（PG bit 在 bit 31），就必須用 `mov cr0`。
+
+---
+
+# Part 4: Segment Descriptor 與 GDT
+
+---
+
+## 14. Segment Descriptor 結構與歷史包袱
+
+### 8 bytes 的結構
+
+```
 Byte 7  Byte 6  Byte 5  Byte 4  Byte 3  Byte 2  Byte 1  Byte 0
 ┌───────┬───────┬───────┬───────┬───────┬───────┬───────┬───────┐
-│Base   │ Flags │Access │Base   │Base Address    │Segment Limit  │
-│31..24 │ Limit │Rights │23..16 │15..0           │15..0          │
+│Base   │G D 0 A│P DPL S│Base   │Base Address    │Segment Limit  │
+│31..24 │  Limit│ Type  │23..16 │15..0           │15..0          │
 │       │19..16 │       │       │                │               │
 └───────┴───────┴───────┴───────┴───────┴───────┴───────┴───────┘
 ```
 
-裡面包含的欄位：
-
-| 欄位 | 大小 | 說明 |
-|------|------|------|
-| **Base Address** | 32 bits | 這塊記憶體的起始位址（被拆成三段分散在 descriptor 裡） |
-| **Limit** | 20 bits | 這塊記憶體的大小上限（也被拆成兩段） |
-| **Type** | 4 bits | 這是什麼類型的 segment（程式碼？資料？可讀？可寫？） |
-| **DPL** | 2 bits | 需要什麼權限等級才能存取（0~3） |
-| **G（Granularity）** | 1 bit | Limit 的單位（byte 或 4KB） |
-| **P（Present）** | 1 bit | 這個 segment 是否真的在記憶體裡 |
-| **S（System）** | 1 bit | 是系統用的 descriptor 還是一般的 code/data |
-| **D/B** | 1 bit | 預設運算元大小（16-bit 或 32-bit） |
-
-為什麼 Base 和 Limit 要被拆開分散在不同位置？因為這個格式是從 286 的 descriptor（只有 base 16-bit、limit 16-bit）擴展來的，為了向下相容，386 只能把新增的 bits 塞在旁邊，所以看起來很亂。這是歷史包袱。
-
-### 2.3 Base Address — 這塊記憶體從哪開始
-
-32-bit 的基底位址被拆成三塊散佈在 descriptor 裡：
+### 為什麼 Base 和 Limit 被拆得這麼散亂？
 
 ```
-Base 完整位址 = Base[31:24] | Base[23:16] | Base[15:0]
-               (byte 7)      (byte 4)      (byte 2-3)
+286 的 Descriptor（6 bytes）：
+Byte 5  Byte 4  Byte 3  Byte 2  Byte 1  Byte 0
+┌───────┬───────┬───────┬───────┬───────┬───────┐
+│ 0 0   │Access │Base   │Base   │Limit  │Limit  │
+│(rsrvd)│Rights │23..16 │15..0  │15..0  │       │
+└───────┴───────┴───────┴───────┴───────┴───────┘
+  ↑ ↑
+  這兩個 byte 是 reserved, must be 0
 ```
 
-例如 Base = `0x00100000`，代表這個 segment 從實體記憶體的 1MB 處開始。
+386 要支援 32-bit base 和 20-bit limit，但又要向後相容 286 的 descriptor 格式，只好把新增的 bits 塞進 286 標記為 reserved 的 byte 5 和 byte 7：
 
-在 Protected Mode 裡，CPU 計算位址的方式變成：
+- Byte 6：放 Limit[19:16]（高 4 bit）+ G、D/B、AVL flags
+- Byte 7：放 Base[31:24]
 
-```
-實體位址 = Base（從 descriptor 裡讀的） + Offset（程式給的）
-```
+所以 386 的 descriptor 看起來 Base 和 Limit 被拆得到處都是——這就是歷史包袱。
 
-而不再是 Real Mode 的 `segment × 16 + offset`。
+> **Reference**: Intel 80386 Manual, Section 5.1:
+> "The 80286 descriptor is 8 bytes long, but only 6 bytes are used. The remaining two bytes are reserved and should be zero. The 80386 uses those reserved bytes."
 
-### 2.4 Limit — 這塊記憶體有多大
+### 對應到 os.c 的 GDT 定義
 
-Limit 是 20 bits，但實際能表示的大小取決於 G bit（Granularity）：
-
-**G = 0（byte 為單位）：**
-
-```
-Limit 的值就是最大的 offset
-20 bits → 最大值 0xFFFFF = 1,048,575
-所以 segment 最大 = 1MB
-```
-
-**G = 1（4KB page 為單位）：**
-
-```
-CPU 會自動把 Limit 左移 12 位，並把低 12 位填 1
-也就是 Limit 變成 (Limit << 12) | 0xFFF
-
-20 bits 左移 12 位 = 32 bits
-最大值 = 0xFFFFF << 12 | 0xFFF = 0xFFFFFFFF = 4GB
+```c
+struct gdt_entry16 {
+    uint16_t limit_low;          // bytes 0-1: Limit[15:0]
+    uint16_t base_low;           // bytes 2-3: Base[15:0]
+    uint16_t base_mid_access;    // byte 4: Base[23:16], byte 5: Access Rights
+    uint16_t flags_limit_basehi; // byte 6: G|D|0|AVL|Limit[19:16], byte 7: Base[31:24]
+} gdt_table[256] = {
+    [KERNEL_CODE_SEG/8] = {0xffff, 0x0000, 0x9a00, 0x00cf},
+    [KERNEL_DATA_SEG/8] = {0xffff, 0x0000, 0x9200, 0x00cf},
+};
 ```
 
-舉例：
+以 Kernel Code Segment（0x9a00, 0x00cf）為例拆解：
 
 ```
-Limit = 0xFFFFF, G = 1
-實際 Limit = 0xFFFFF × 4096 + 4095 = 0xFFFFFFFF = 4GB
+Access byte (0x9A) = 1001 1010
+  P=1（Present）
+  DPL=00（Ring 0）
+  S=1（code/data segment，不是 system descriptor）
+  Type=1010（Code, Execute/Read）
 
-Limit = 0x00001, G = 1
-實際 Limit = 0x00001 × 4096 + 4095 = 8191 = 8KB
+Flags + Limit high (0xCF) = 1100 1111
+  G=1（4KB granularity）
+  D=1（32-bit default operand size）
+  0（reserved）
+  AVL=0
+  Limit[19:16]=1111
+
+完整 Limit = 0xFFFFF，G=1 → 實際大小 = 4GB
+完整 Base = 0x00000000 → 從位址 0 開始
 ```
-
-為什麼這樣設計？因為 20 bits 只能表示 1MB，但 386 是 32-bit CPU、能定址 4GB。加一個 G bit 讓它乘以 4096，就能用 20 bits 表達最大 4GB 的範圍。代價是 G=1 時最小單位變成 4KB。
-
-### 2.5 Type 欄位 — 這塊記憶體是什麼類型
-
-Type 是 4 bits，意義取決於 S bit（System bit）：
-
-**S = 1（一般的 code/data segment）：**
-
-```
-Type 的 4 個 bit 分別是：
-
-Bit 3: 0 = Data segment, 1 = Code segment
-
-如果是 Data segment（Bit 3 = 0）：
-  Bit 2 (E): Expand direction, 0 = 向上長, 1 = 向下長（用於 stack）
-  Bit 1 (W): 0 = 唯讀, 1 = 可讀可寫
-  Bit 0 (A): Accessed（CPU 自動設，表示有被存取過）
-
-如果是 Code segment（Bit 3 = 1）：
-  Bit 2 (C): Conforming, 0 = 一般, 1 = conforming（特殊權限行為）
-  Bit 1 (R): 0 = 只能執行不能讀, 1 = 可執行也可讀
-  Bit 0 (A): Accessed
-```
-
-用表格列出來：
-
-| Type 值 | 說明 |
-|---------|------|
-| `0000` | Data：唯讀 |
-| `0010` | Data：可讀寫 |
-| `0100` | Data：唯讀，expand-down |
-| `0110` | Data：可讀寫，expand-down |
-| `1000` | Code：只能執行 |
-| `1010` | Code：可執行、可讀 |
-| `1100` | Code：只能執行，conforming |
-| `1110` | Code：可執行、可讀，conforming |
-
-重點理解：
-
-- **可寫（W）**：Data segment 可以設定是否允許寫入。如果 W=0，任何寫入操作都會讓 CPU 報錯。Code segment 永遠不能寫入。
-- **可讀（R）**：Code segment 可以設定是否允許讀取裡面的資料（例如讀常數）。如果 R=0，只能執行，不能用 `mov` 去讀裡面的值。
-- **Conforming（C）**：允許低權限的程式「借用」高權限的程式碼，但不會改變呼叫者的權限。
-
-CPU 什麼時候做 Type 檢查？兩個時機：
-
-1. **載入 selector 到 segment register 時**：例如你不能把一個 data segment 的 selector 載入 CS（CS 只接受 code segment）。你也不能把一個不可讀的 code segment 載入 DS（DS 是拿來讀資料的）。
-2. **指令實際使用 segment register 時**：例如你不能對一個 code segment 做寫入操作，即使你用了 segment override。
-
-**S = 0（System descriptor）：**
-
-S=0 時，Type 欄位代表的是系統用的特殊 descriptor：
-
-| Type | 說明 |
-|------|------|
-| `0x0` | 保留 |
-| `0x1` | Available 286 TSS |
-| `0x2` | LDT |
-| `0x3` | Busy 286 TSS |
-| `0x4` | Call Gate |
-| `0x5` | Task Gate |
-| `0x6` | 286 Interrupt Gate |
-| `0x7` | 286 Trap Gate |
-| `0x9` | Available 386 TSS |
-| `0xB` | Busy 386 TSS |
-| `0xC` | 386 Call Gate |
-| `0xE` | 386 Interrupt Gate |
-| `0xF` | 386 Trap Gate |
-
-這些是給 OS 用的特殊結構，後面講 Gate 時會用到。
 
 ---
 
-## 3. Descriptor Table（描述符表格）
+## 15. 286 的 16-bit Limit 為什麼合理？
 
-### 3.1 GDT（Global Descriptor Table）
+### 問題
 
-所有的 Segment Descriptor 存在一個表格裡，這個表格叫 GDT。它就是記憶體裡的一個陣列，每個 entry 是 8 bytes。
+286 有 24-bit base（可以放在 16MB 的任何位置），但 limit 只有 16-bit（最大 64KB）。這不是很不合理嗎？記憶體有 16MB 但每個 segment 只能用 64KB？
 
-```
-記憶體中的 GDT：
+### 答案
 
-位址             內容
-──────────────────────────────────
-GDT Base+0x00:  Index 0: NULL Descriptor（保留，不能用）
-GDT Base+0x08:  Index 1: 例如 Kernel Code Segment
-                  Base=0, Limit=4GB, Type=Code 可讀, DPL=0
-GDT Base+0x10:  Index 2: 例如 Kernel Data Segment
-                  Base=0, Limit=4GB, Type=Data 可讀寫, DPL=0
-GDT Base+0x18:  Index 3: 例如 User Code Segment
-                  Base=0, Limit=4GB, Type=Code 可讀, DPL=3
-...以此類推
-```
-
-GDT 的位址和大小存在一個特殊暫存器 GDTR 裡，用特權指令 `lgdt` 來設定：
-
-```asm
-lgdt [gdt_descriptor]    ; 告訴 CPU：GDT 在記憶體的哪裡、有多大
-```
-
-GDT 本身也有一個 limit（存在 GDTR 裡），用來表示「GDT 表格的最大有效位址」。因為每個 descriptor 是 8 bytes，如果有 N 個 descriptor，limit = N × 8 - 1。CPU 在查表時會檢查你給的 index 有沒有超過這個 limit。
-
-### 3.2 LDT（Local Descriptor Table）
-
-除了全域的 GDT，還有 LDT——每個 task（process）可以有自己的 LDT。GDT 是全系統共享的，LDT 是各 task 私有的。
+**因為 286 的 offset register 也是 16-bit**。
 
 ```
-GDT ← 所有 task 共用（裝 kernel 的 segment、共享的 segment）
-LDT ← 每個 task 各自擁有（裝自己私有的 segment）
+記憶體存取 = Base + Offset
+                      ↑
+                 這個 offset 來自 16-bit register（IP、SP、BX、SI、DI...）
+                 16-bit register 最大值 = 0xFFFF = 65535
 ```
 
-不過現代 OS 幾乎不用 LDT，因為 paging 已經能做到隔離了。
+即使你把 limit 設成 1MB，程式也沒辦法產生超過 0xFFFF 的 offset。所以 16-bit limit 剛好對應 16-bit offset register 的能力，完全合理。
 
-### 3.3 Selector（選擇子）
+24-bit base 的意義是：每個 segment（最大 64KB）可以**放在 16MB 記憶體空間中的任意位置**。這讓 OS 可以把不同的程式（每個最大 64KB）分散在 16MB 的不同位址。
 
-存在 segment register 裡的值叫 selector，它不是位址，而是一個結構化的 16-bit 值：
+到了 386，offset register 變成 32-bit（最大 4GB），所以 limit 也要能表示最大 4GB，因此設計了 20-bit limit + G bit（granularity）的方案。
+
+---
+
+## 16. 4GB 是每個 Segment 的上限還是總共的？
+
+### 答案：兩者皆是，但意義不同
+
+**每個 segment 最大 4GB**：
+- 一個 segment 的 Limit 最大可以設為 0xFFFFF、G=1 → 4GB
+- 這代表你可以有一個 4GB 大的 segment
+
+**物理記憶體總共 4GB**：
+- 386 的 address bus 是 32-bit → 最大定址 4GB 物理記憶體
+
+**Flat Model（現代 OS 的做法）**：
+所有 segment 的 base = 0、limit = 4GB。這代表每個 segment 都涵蓋整個 4GB 的位址空間，彼此完全重疊：
+
+```
+位址空間：
+0x00000000 ┌──────────────┐
+           │              │ ← CS 看到的範圍（base=0, limit=4GB）
+           │              │ ← DS 看到的範圍（base=0, limit=4GB）
+           │              │ ← SS 看到的範圍（base=0, limit=4GB）
+           │  全部重疊     │    全部都是同一個 4GB
+0xFFFFFFFF └──────────────┘
+```
+
+Segmentation 在 flat model 下等於沒有作用，真正的記憶體保護交給 **paging** 來做。
+
+---
+
+## 17. GDT、LDT 與 8192 Descriptors
+
+### 8192 的計算
+
+Selector 的 Index 欄位是 **13 bits**：
 
 ```
 15                        3  2  1  0
@@ -275,371 +736,365 @@ LDT ← 每個 task 各自擁有（裝自己私有的 segment）
 │        Index           │TI │ RPL │
 │     (13 bits)          │   │(2b) │
 └────────────────────────┴───┴─────┘
-
-Index: 在 GDT 或 LDT 裡的第幾個 entry（13 bits → 最多 8192 個 entry）
-TI:    Table Indicator
-       0 = 去 GDT 找
-       1 = 去 LDT 找
-RPL:   Requestor's Privilege Level（請求者權限，後面會詳細講）
 ```
 
-舉例：
+2^13 = 8192 → 每個 table（GDT 或 LDT）最多 8192 個 entries。
+
+> **Reference**: Intel 80386 Manual, Section 5.1.1:
+> "Each descriptor table can hold up to 8192 (2^13) descriptors."
+
+### 64TB 虛擬位址空間
 
 ```
-selector = 0x08 = 0000 0000 0000 1000
-  Index = 1, TI = 0（GDT）, RPL = 0
-
-selector = 0x10 = 0000 0000 0001 0000
-  Index = 2, TI = 0（GDT）, RPL = 0
-
-selector = 0x1B = 0000 0000 0001 1011
-  Index = 3, TI = 0（GDT）, RPL = 3
+GDT: 8192 descriptors × 每個 segment 最大 4GB = 32TB
+LDT: 8192 descriptors × 每個 segment 最大 4GB = 32TB
+總共: 32TB + 32TB = 64TB
 ```
 
-### 3.4 Segment Register 的隱藏部分
+> **Reference**: Intel 80386 Manual, Section 5.1:
+> "Each task can have a maximum of 16,381 segments... each segment can be as large as 4 gigabytes, tasks can have a logical address space of as much as 64 terabytes."
+> （16381 = 8191 from GDT + 8190 from LDT，扣掉 GDT index 0 是 NULL descriptor）
 
-每個 segment register 其實有「看得到」和「看不到」兩個部分：
+### LDT 是什麼？
+
+GDT = **Global** Descriptor Table，全系統共享一個。
+LDT = **Local** Descriptor Table，每個 task/process 可以有自己的。
 
 ```
-DS 的完整結構：
-
-  看得到的部分（16 bits）：
-  ┌──────────┐
-  │ Selector │  ← 你用 mov ds, ax 設的值
-  └──────────┘
-
-  看不到的部分（hidden/cached，CPU 內部自動填入）：
-  ┌──────────────────────────────────────┐
-  │ Base Address (32 bits)               │  ← 從 descriptor 載入的
-  │ Limit (32 bits)                      │  ← 從 descriptor 載入的
-  │ Access Rights (Type, DPL, etc.)      │  ← 從 descriptor 載入的
-  └──────────────────────────────────────┘
+                    ┌─── GDT（全域共享）
+                    │    放 kernel segments、TSS、共用 segments
+CPU ───selector───→ │
+       TI bit=0 ─→ │
+       TI bit=1 ─→ └─── LDT（每個 task 私有）
+                         放該 task 自己的 code/data segments
 ```
 
-為什麼要 cache？因為如果 CPU 每次存取記憶體都要先去 GDT 查表，太慢了。所以當你 `mov ds, ax` 時，CPU 會一次查好，把結果存在 segment register 的隱藏部分。之後每次用 DS 存取記憶體，CPU 直接看 cache 裡的資訊做保護檢查，不需要額外的時鐘週期。
+Selector 的 TI bit 決定去 GDT 還是 LDT 查找。
+
+### 為什麼現代 OS 不用 LDT？
+
+- **Flat model 不需要**：所有 segment base=0、limit=4GB，每個 process 用同樣的 segment descriptors
+- **Paging 取代了隔離功能**：每個 process 有自己的 page table，已經完美隔離了記憶體空間
+- **複雜度**：維護每個 process 的 LDT 增加 context switch 的成本，沒有實際好處
+
+> **Reference**: Linux kernel source code (`arch/x86/include/asm/mmu_context.h`):
+> Linux 只在極少數情況（如 Wine 模擬 Windows 的 segment 行為）才建立 LDT，預設不使用。
 
 ---
 
-## 4. Privilege Level（權限等級）
+## 18. GDT Descriptor（gdt_desc）的格式解析
 
-### 4.1 四個權限等級
+### start.S 中的 gdt_desc
 
-CPU 定義了 4 個權限等級，用數字 0~3 表示，數字越小權限越大：
-
-```
-         ┌───────────────┐
-         │   Ring 0      │  ← 最高權限（OS Kernel）
-         │ ┌───────────┐ │
-         │ │  Ring 1    │ │  ← OS 驅動程式（很少用）
-         │ │ ┌───────┐  │ │
-         │ │ │Ring 2 │  │ │  ← OS 服務（很少用）
-         │ │ │┌─────┐│  │ │
-         │ │ ││Ring3││  │ │  ← 最低權限（一般應用程式）
-         │ │ │└─────┘│  │ │
-         │ │ └───────┘  │ │
-         │ └───────────┘ │
-         └───────────────┘
+```asm
+gdt_desc:
+.word (256*8) - 1    ; GDT 的 limit（2 bytes）
+.long gdt_table      ; GDT 的 base address（4 bytes）
 ```
 
-實際上大多數 OS（Linux、Windows）只用兩個：
+### 為什麼 limit 要 -1？
 
-- **Ring 0** = Kernel mode
-- **Ring 3** = User mode
+`lgdt` 載入的 limit 值代表**GDT 的最後一個有效 byte 的 offset**，不是大小。
 
-Ring 1 和 Ring 2 幾乎沒人用。如果你的系統只需要一個層級（沒有保護需求），用 Ring 0 就好。如果要兩個層級，用 Ring 0 和 Ring 3。
-
-### 4.2 三個關鍵的權限值
-
-CPU 在每次記憶體存取或控制轉移時，會比較三個權限值：
-
-#### CPL（Current Privilege Level）— 你現在是誰
+Intel 的定義是：
 
 ```
-CPL = 目前正在執行的程式的權限等級
+有效範圍 = base 到 base + limit（包含 limit 這個 byte）
 ```
 
-它存在 CS register 的最低 2 bits（就是 selector 的 RPL 欄位）。
+所以如果你有 256 個 entries，每個 8 bytes：
+- 總大小 = 256 × 8 = 2048 bytes
+- 有效的 offset 範圍 = 0 到 2047
+- limit = 2047 = 2048 - 1 = (256 × 8) - 1
+
+如果你寫 limit = 2048（不減 1），CPU 會認為有效範圍是 0 到 2048，多出一個 byte。雖然在實際運作中不會造成問題，但不符合 Intel 的規範。
+
+> **Reference**: Intel 80386 Manual, Section 5.1.1:
+> "The limit value is the number of bytes from the base address. Since segment selectors are always a multiple of 8... the limit should be 8N - 1."
+
+### .long gdt_table 是什麼？
+
+`gdt_table` 是在 `os.c` 裡定義的 C array 的符號。Linker 會把它解析為 `gdt_table` 的實際記憶體位址，然後寫入這 4 bytes。
+
+---
+
+## 19. Protected Mode 中 CS 是 Selector，那 Offset 是什麼？
+
+### 問題
+
+```asm
+jmp KERNEL_CODE_SEG:_start_32
+```
+
+`KERNEL_CODE_SEG`（0x08）是 GDT 的 selector（index），不再是 segment base。那 `:` 後面的 `_start_32` 代表什麼？
+
+### 答案
+
+在 Protected Mode 的 flat model 下：
 
 ```
-如果 CS = 0x08（RPL = 0）→ CPL = 0 → 你是 Kernel
-如果 CS = 0x1B（RPL = 3）→ CPL = 3 → 你是一般程式
+線性位址 = Base（從 GDT descriptor 讀出的）+ Offset（指令中給的）
 ```
 
-正常情況下，CPL 等於目前執行的 code segment 的 DPL。只有在 conforming segment 的情況下，CPL 可能跟 DPL 不同。
+1. CPU 拿 selector 0x08 去 GDT 查找 → 得到 descriptor → Base = 0x00000000
+2. Offset = `_start_32` 的值（例如 0x7E00）
+3. 線性位址 = 0x00000000 + 0x7E00 = 0x7E00
 
-#### DPL（Descriptor Privilege Level）— 門上寫的等級
+因為 flat model 的 base 都是 0，所以 offset 就等於最終位址。這就是為什麼你可以直接把 label 當 offset 用——label 的值本身就是位址。
+
+---
+
+# Part 5: Segment-Level Protection
+
+---
+
+## 20. 為什麼需要保護？
+
+### Real Mode 的問題
+
+```
+程式 A 想寫 0x1234 → OK
+程式 B 想寫 0x1234 → OK，A 的資料被蓋掉了
+惡意程式想改 OS 的記憶體 → OK，整台電腦被搞爛
+惡意程式想執行特權指令 → OK，電腦直接當掉
+```
+
+### Protected Mode 的五種保護
+
+1. **Type Checking** — 用對方式了嗎？（不能把資料當 code 跳，不能寫 read-only）
+2. **Limit Checking** — 超出範圍了嗎？
+3. **Privilege Checking** — 有權限嗎？
+4. **Entry Point Restriction** — 走對入口了嗎？（只能透過 Gate 進入 OS）
+5. **Instruction Restriction** — 用了不該用的指令嗎？（如 `lgdt`、`hlt`）
+
+全部由 CPU 硬體自動檢查。
+
+> **Reference**: Intel 80386 Manual, Section 6.3:
+> "The 80386 has five aspects of protection... segment type checks, limit checks, privilege level checks, restriction of addressable domain, restriction on procedure entry points, and instruction restrictions."
+
+---
+
+## 21. Type 欄位詳解（S、E、ED/C、R/W、A）
+
+### Access Byte 結構
+
+```
+Bit 7    Bit 6-5   Bit 4   Bit 3   Bit 2    Bit 1   Bit 0
+┌────────┬────────┬───────┬───────┬────────┬───────┬───────┐
+│   P    │  DPL   │   S   │   E   │ ED / C │ R / W │   A   │
+│Present │ Priv   │System │Exec   │Expand  │Read   │Access │
+│        │ Level  │       │       │or Conf │or Wrt │  ed   │
+└────────┴────────┴───────┴───────┴────────┴───────┴───────┘
+```
+
+### S bit — System or Code/Data
+
+| S | 意義 |
+|---|---|
+| 1 | 一般的 code 或 data segment |
+| 0 | System descriptor（TSS、Gate、LDT 等） |
+
+### 當 S=1 時，E/ED(C)/R(W)/A 的含義
+
+**E = 0（Data Segment）**：
+
+| Type 值 | ED | W | A | 說明 |
+|---|---|---|---|---|
+| 0000 | 0 | 0 | 0 | Read-Only |
+| 0010 | 0 | 1 | 0 | Read/Write |
+| 0100 | 1 | 0 | 0 | Read-Only, Expand-Down |
+| 0110 | 1 | 1 | 0 | Read/Write, Expand-Down |
+
+**E = 1（Code Segment）**：
+
+| Type 值 | C | R | A | 說明 |
+|---|---|---|---|---|
+| 1000 | 0 | 0 | 0 | Execute-Only |
+| 1010 | 0 | 1 | 0 | Execute/Read |
+| 1100 | 1 | 0 | 0 | Execute-Only, Conforming |
+| 1110 | 1 | 1 | 0 | Execute/Read, Conforming |
+
+### A bit（Accessed）
+
+CPU 每次存取一個 segment 時會自動把 A bit 設為 1。OS 可以定期清除它，然後觀察哪些 segment 有被存取過——用於記憶體管理的 LRU 演算法。現代 OS 用 paging 的 Accessed bit 做同樣的事。
+
+---
+
+## 22. System Descriptor（S=0）的用途
+
+### 所有 System Descriptor 類型
+
+| Type | 說明 | 現代 OS 還用嗎？ |
+|---|---|---|
+| 0x1 | Available 286 TSS | ❌ |
+| 0x2 | LDT | ❌（幾乎不用） |
+| 0x3 | Busy 286 TSS | ❌ |
+| 0x4 | Call Gate | ❌（用 syscall/sysenter 取代） |
+| 0x5 | Task Gate | ❌ |
+| 0x6 | 286 Interrupt Gate | ❌ |
+| 0x7 | 286 Trap Gate | ❌ |
+| 0x9 | Available 386 TSS | ✅ |
+| 0xB | Busy 386 TSS | ✅ |
+| 0xC | 386 Call Gate | ❌ |
+| 0xE | 386 Interrupt Gate | ✅ |
+| 0xF | 386 Trap Gate | ✅ |
+
+### 為什麼 GDT 中 S bit 還在用？
+
+因為 GDT 裡同時存在 S=1 的 descriptor（code/data segment）和 S=0 的 descriptor（TSS descriptor）。CPU 需要 S bit 來區分：
+
+```
+GDT:
+Index 0: NULL
+Index 1: Kernel Code (S=1, E=1) ← 一般 segment
+Index 2: Kernel Data (S=1, E=0) ← 一般 segment
+Index 3: User Code   (S=1, E=1) ← 一般 segment
+Index 4: User Data   (S=1, E=0) ← 一般 segment
+Index 5: TSS         (S=0, Type=0x9) ← system descriptor，格式完全不同！
+```
+
+### TSS Descriptor 的功能
+
+TSS Descriptor 不直接存放 stack 資訊。它的作用是**指向一塊記憶體中的 TSS 結構**。
+
+```
+GDT 裡的 TSS Descriptor → 指向記憶體中的 TSS 結構 → 裡面有 RSP0、IST 等
+
+TSS 結構（64-bit mode 精簡版）：
+┌──────────────────┐
+│ Reserved         │
+│ RSP0             │ ← Ring 3 → Ring 0 時的 stack pointer（最重要！）
+│ RSP1             │
+│ RSP2             │
+│ IST1 ~ IST7      │ ← Interrupt Stack Table（NMI、Double Fault 用）
+│ I/O Map Base     │
+└──────────────────┘
+```
+
+每個 CPU core 有一個 TSS。當發生 system call 或中斷、需要從 Ring 3 切到 Ring 0 時，CPU 從 TSS 讀取 RSP0 作為新的 stack pointer。
+
+> **Reference**: Linux kernel source (`arch/x86/kernel/cpu/common.c`, `cpu_init()`):
+> 每個 CPU 在初始化時都會設定自己的 TSS，指定 RSP0 為 kernel stack。
+
+---
+
+## 23. Privilege Level：CPL、DPL、RPL
+
+### CPL（Current Privilege Level）
+
+```
+CPL = CS register 的 RPL 欄位（最低 2 bits）
+    = 你「現在」的權限等級
+```
+
+- CS = 0x08（RPL=0）→ CPL = 0 → Kernel mode
+- CS = 0x1B（RPL=3）→ CPL = 3 → User mode
+
+### DPL（Descriptor Privilege Level）
 
 ```
 DPL = 寫在 descriptor 裡的權限等級
     = 「你至少要有這個等級才能存取我」
 ```
 
-例如一個 data segment 的 DPL = 0，代表只有 Ring 0 的程式能存取。
-
-#### RPL（Requestor's Privilege Level）— 請求者聲稱的等級
+### RPL（Requestor's Privilege Level）
 
 ```
-RPL = 寫在 selector 最低 2 bits 的權限值
+RPL = selector 最低 2 bits
     = 「原始請求者的權限等級」
 ```
 
-RPL 存在的意義是防止冒充。用一個例子解釋：
+防冒充機制——詳見後面的 [五種保護機制](#24-五種保護機制)。
 
-```
-場景：OS 提供一個「讀檔案」的 system call
-       FREAD(file_id, n_bytes, buffer_ptr)
+### 現代 OS 中的使用情況
 
-正常使用（Ring 3 的程式）：
-  buffer_ptr 指向自己的記憶體 → OK，正常讀檔
+| 機制 | 還在用嗎？ | 說明 |
+|---|---|---|
+| **CPL** | ✅ 核心使用 | Paging 依賴 CPL：page table entry 的 U/S bit 就是看 CPL 決定能不能存取 |
+| **DPL** | ✅ 簡化使用 | 只用 0 和 3 兩個值。Code/Data segment 的 DPL 配合 flat model |
+| **RPL** | ❌ 幾乎不用 | Paging 已經提供了足夠的保護，不需要 RPL 的防冒充機制 |
 
-攻擊嘗試：
-  Ring 3 的惡意程式呼叫 FREAD
-  但 buffer_ptr 故意指向 OS 的 file table 記憶體
-  如果 OS 不小心用 Ring 0 的權限去寫這個 buffer_ptr...
-  → OS 的 file table 就被惡意程式覆蓋了！
-```
-
-RPL 就是為了防止這種事。當 Ring 3 傳一個 pointer 給 Ring 0 時：
-
-```
-Ring 3 傳入的 selector，RPL = 3（標記：「這個 pointer 來自 Ring 3」）
-
-OS（Ring 0）用這個 selector 存取記憶體時，CPU 檢查：
-  MAX(CPL, RPL) ≤ DPL ?
-  MAX(0, 3) = 3
-  3 ≤ 0 ?  → 不是！CPU 拒絕存取
-
-即使 OS 是 Ring 0，但因為 RPL = 3，CPU 知道這個 pointer 來自 Ring 3，
-所以用 Ring 3 的標準來檢查，保護了 OS 的記憶體。
-```
-
-還有一個專門的指令 ARPL（Adjust RPL）來幫 OS 做這件事：它確保 selector 的 RPL 至少跟呼叫者的 CPL 一樣大，防止權限提升。
+> **Reference**: Intel SDM Volume 3A, Section 4.6:
+> "Every access to a linear address is either a supervisor-mode access or a user-mode access. All accesses performed while CPL < 3 are supervisor-mode accesses."
 
 ---
 
-## 5. 五種保護機制詳解
+## 24. 五種保護機制
 
-### 5.1 Type Checking（類型檢查）
-
-CPU 會檢查你有沒有「用錯方式」存取 segment：
+### 24.1 Type Checking
 
 ```
-把 data segment 的 selector 載入 CS        → CS 只接受 code segment
-把不可讀的 code segment 的 selector 載入 DS → DS 是拿來讀資料的，segment 必須可讀
-對 code segment 做寫入操作                  → code segment 永遠不可寫
-對唯讀 data segment 做寫入操作              → W bit = 0，不允許寫入
-把 data segment 拿來執行                    → 只有 code segment 可以執行
+把 data segment 載入 CS        → ❌ CS 只接受 code segment
+把不可讀 code segment 載入 DS  → ❌ DS 是讀資料的，segment 必須可讀
+對 code segment 做寫入操作      → ❌ code segment 永遠不可寫
+對唯讀 data segment 做寫入      → ❌ W bit = 0
 ```
 
-以上任何一項都會讓 CPU 觸發 General Protection Fault。
+### 24.2 Limit Checking
 
-### 5.2 Limit Checking（範圍檢查）
+**Expand-Up（一般 segment）**：有效 offset = 0 到 Limit
 
-CPU 會確保你的 offset 沒有超出 segment 的大小。
+**Expand-Down（stack segment）**：有效 offset = (Limit+1) 到 上限
 
-**一般 segment（Expand-Up，向上擴展）：**
+G bit 決定 Limit 的單位（byte 或 4KB page）：
 
-```
-有效 offset 範圍：0 到 Limit
+| G | Limit 值 0xFFFFF 的實際大小 |
+|---|---|
+| 0 | 1MB |
+| 1 | 4GB（0xFFFFF × 4096 + 4095 = 0xFFFFFFFF） |
 
-例如 Limit = 0xFFFF：
-  mov al, [ds:0x0000]   → OK
-  mov al, [ds:0xFFFF]   → OK（offset = limit，最後一個 byte）
-  mov al, [ds:0x10000]  → General Protection Fault！超出 limit
-```
-
-精確規則（因為不同大小的存取會跨越多個 byte）：
-
-- byte 存取：offset > limit → fault
-- word（2 bytes）存取：offset >= limit → fault
-- dword（4 bytes）存取：offset >= (limit - 2) → fault
-
-**Expand-Down segment（向下擴展，用於 stack）：**
-
-Stack 是從高位址往低位址長的，所以 expand-down segment 的有效範圍剛好相反：
-
-```
-有效 offset 範圍：(Limit + 1) 到 上限
-
-上限取決於 B bit：
-  B = 0 → 上限是 0xFFFF（64KB）
-  B = 1 → 上限是 0xFFFFFFFF（4GB）
-```
-
-```
-例如 Expand-Down，B=0，Limit = 0x7FFF：
-  有效範圍 = 0x8000 ~ 0xFFFF
-
-  mov al, [ss:0x8000]   → OK
-  mov al, [ss:0xFFFF]   → OK
-  mov al, [ss:0x7FFF]   → 超出（在 limit 以下）
-  mov al, [ss:0x0000]   → 超出
-```
-
-為什麼 expand-down 要這樣設計？因為 stack 需要動態成長。當你需要更大的 stack 時，只要減小 limit 的值，有效範圍就自動變大，不需要搬移 stack 裡已有的資料，也不需要更新 stack 裡的 pointer。
-
-**各種 E、G、B 組合的完整表格：**
-
-| Expand | G | B | 有效下界 | 有效上界 | 最大 size | 最小 size |
-|--------|---|---|---------|---------|-----------|-----------|
-| Up | 0 | X | 0 | Limit | 64KB | 0 |
-| Up | 1 | X | 0 | Limit×4096+4095 | 4GB-4KB | 4KB |
-| Down | 0 | 0 | Limit+1 | 0xFFFF | 64KB | 0 |
-| Down | 1 | 1 | Limit×4096+4096 | 0xFFFFFFFF | 4GB | 4KB |
-
-### 5.3 Privilege Checking — 存取 Data
-
-當你想把一個 selector 載入 DS、ES、FS、GS（存取資料用的 segment register）時，CPU 做以下檢查：
+### 24.3 Privilege Checking — Data Access
 
 ```
 規則：DPL >= MAX(CPL, RPL)
 
-白話：目標 segment 的權限等級（DPL）必須 >= 你的權限等級和請求者權限等級中較大的那個
-（記住：數字越大 = 權限越小）
+CPL=0, RPL=0, DPL=0 → MAX(0,0)=0, 0>=0 ✅ Kernel 存取 Kernel 資料
+CPL=3, RPL=3, DPL=0 → MAX(3,3)=3, 0>=3 ❌ User 不能存取 Kernel 資料
+CPL=0, RPL=3, DPL=0 → MAX(0,3)=3, 0>=3 ❌ RPL 防冒充生效
 ```
 
-舉例：
+### 24.4 Privilege Checking — Code Transfer
 
-```
-情況 1：CPL=0, RPL=0, 目標 DPL=0
-  MAX(0,0) = 0,  DPL(0) >= 0  → Kernel 存取 Kernel 資料 ✓
+**直接 JMP/CALL**：
+- Non-conforming：目標 DPL 必須 = CPL（只能跳到同權限）
+- Conforming：目標 DPL ≤ CPL（可以跳到更高權限，但 CPL 不變）
 
-情況 2：CPL=0, RPL=0, 目標 DPL=3
-  MAX(0,0) = 0,  DPL(3) >= 0  → Kernel 存取 User 資料 ✓
+**透過 Call Gate**：
+- MAX(CPL, RPL) ≤ Gate DPL（你有資格用 Gate 嗎？）
+- Target DPL ≤ CPL（目標權限比你高，合理）
+- CALL 可以提升 CPL；JMP 不能提升 CPL
 
-情況 3：CPL=3, RPL=3, 目標 DPL=0
-  MAX(3,3) = 3,  DPL(0) >= 3? → User 不能存取 Kernel 資料 ✗
+### 24.5 Instruction Restriction
 
-情況 4：CPL=0, RPL=3, 目標 DPL=0
-  MAX(0,3) = 3,  DPL(0) >= 3? → 雖然是 Kernel 在跑，
-                                  但 RPL=3 表示 pointer 來自 User，
-                                  所以 CPU 拒絕（防冒充機制）✗
-```
+只有 CPL = 0 才能執行的指令：
 
-不同 CPL 能看到的資料範圍：
+| 指令 | 用途 |
+|---|---|
+| `lgdt` / `lidt` | 載入 GDT/IDT 暫存器 |
+| `lldt` / `ltr` | 載入 LDT/Task Register |
+| `lmsw` / `mov crN` | 修改控制暫存器 |
+| `hlt` | 停止 CPU |
+| `mov drN` | 讀寫 debug 暫存器 |
+| `clts` | 清除 Task-Switched flag |
 
-```
-CPL = 0 → 可存取 DPL = 0, 1, 2, 3 的資料（全部）
-CPL = 1 → 可存取 DPL = 1, 2, 3 的資料
-CPL = 2 → 可存取 DPL = 2, 3 的資料
-CPL = 3 → 可存取 DPL = 3 的資料（只有自己的）
-```
-
-### 5.4 讀取 Code Segment 裡的資料
-
-有時候 code segment 裡會放常數（例如查找表），有三種方法可以讀取：
-
-**方法 1：把 code segment 的 selector 載入 data segment register**
-
-```asm
-mov ds, code_selector    ; 把 code segment 當作 data 來讀
-mov al, [ds:0x100]       ; 讀 code segment 裡 offset 0x100 的值
-```
-
-前提：code segment 必須是可讀的（R bit = 1），而且非 conforming 的 code segment 適用標準的 data segment 權限檢查規則。
-
-**方法 2：Conforming code segment**
-
-如果 code segment 是 conforming 的，任何權限等級都可以把它的 selector 載入 data segment register 來讀（不做 DPL 檢查）。
-
-**方法 3：用 CS override prefix**
-
-```asm
-mov al, [cs:0x100]    ; 用 CS: 前綴直接讀當前 code segment 的資料
-```
-
-這永遠合法，因為你已經在執行這個 code segment 了，它的 DPL 一定等於你的 CPL。
-
-### 5.5 Control Transfer — JMP 和 CALL 的權限規則
-
-**Near transfer（段內跳轉）：**
-
-```asm
-jmp short label    ; 在同一個 code segment 裡跳
-call near_func     ; 在同一個 code segment 裡呼叫
-```
-
-因為沒有離開當前 segment，所以只做 limit 檢查（確保目標 offset 沒超出 segment 大小），不做權限檢查。而且 limit 已經 cache 在 CS register 裡了，所以不需要額外的時鐘週期。
-
-**Far transfer — 直接跳到另一個 code segment：**
-
-```asm
-jmp 0x08:some_offset     ; 跳到另一個 code segment
-call far_ptr             ; 呼叫另一個 segment 的函數
-```
-
-規則：
-
-```
-非 conforming code segment：
-  目標的 DPL 必須 = CPL（只能跳到同權限的 segment）
-
-Conforming code segment：
-  目標的 DPL 必須 <= CPL（可以跳到權限 >= 自己的 segment）
-  但 CPL 不會改變！你借用了高權限的程式碼，但還是以自己的權限在跑。
-```
-
-重要：直接跳轉不能提升權限。如果你是 Ring 3，你不能直接 JMP 或 CALL 到 Ring 0 的非 conforming segment。要提升權限，必須透過 Gate。
-
-### 5.6 Conforming Segment 到底是什麼
-
-Conforming segment 是一種特殊的 code segment，允許低權限的程式呼叫它，但不會改變呼叫者的權限等級。
-
-```
-場景：一個數學函式庫（sin、cos、sqrt）放在 Ring 0 的 conforming segment
-
-Ring 3 的程式呼叫 sin() → 允許
-  但 CPL 還是 3（不會變成 0）
-  sin() 裡面如果嘗試做 Ring 0 的事 → 還是被拒絕
-
-這跟 Call Gate 的差別：
-  Call Gate 呼叫 → CPL 真的變成 0（權限提升了）
-  Conforming 呼叫 → CPL 維持 3（只是借用程式碼，沒提升權限）
-```
-
-適用場景：exception handler、共用的數學函式庫等——程式碼本身不需要高權限，但需要被各種權限等級的程式呼叫。
+I/O 指令（`in`、`out`、`cli`、`sti`）受 IOPL 控制：CPL ≤ IOPL 才能執行。
 
 ---
 
-## 6. Gate Descriptor（閘門描述符）
+## 25. Gate Descriptor（閘門描述符）
 
-### 6.1 為什麼需要 Gate
+### 為什麼需要 Gate？
 
-直接 JMP/CALL 不能提升權限。但 Ring 3 的程式總是需要呼叫 OS 的功能（讀檔案、網路、分配記憶體...），怎麼辦？
-
-答案：透過 Call Gate。它就像一個受控的入口，讓低權限程式可以安全地呼叫高權限程式碼。
+直接 JMP/CALL 不能提升權限。Ring 3 需要呼叫 OS 功能時，必須透過 Gate：
 
 ```
-沒有 Gate：
-  Ring 3 → jmp 到 Ring 0 的任意位址 → CPU 拒絕
-
-有 Gate：
-  Ring 3 → call gate → 只能跳到 Gate 裡指定的入口點 → 安全
-
-類比：
-  你不能自己走進銀行金庫
-  但你可以透過「服務窗口」（Gate）請行員幫你操作
-  而且只能做窗口允許的事
+沒有 Gate：Ring 3 → jmp Ring 0 任意位址 → ❌ CPU 拒絕
+有 Gate：  Ring 3 → call gate → 只能跳到 Gate 指定的入口 → ✅ 安全
 ```
 
-### 6.2 Gate 的四種類型
-
-| 類型 | 說明 |
-|------|------|
-| Call Gate | 程式碼間的權限轉移 |
-| Trap Gate | 同步例外處理（本篇不展開） |
-| Interrupt Gate | 中斷處理（本篇不展開） |
-| Task Gate | 任務切換（本篇不展開） |
-
-本節只討論 Call Gate。
-
-### 6.3 Call Gate 的結構
-
-Call Gate 也是一個 descriptor（8 bytes），但格式跟 segment descriptor 不同：
+### Gate 的結構
 
 ```
-一個 Call Gate Descriptor（8 bytes）：
-
 ┌────────────────────────────────────────────┐
 │ Offset 31..16    （目標函數的 offset 高 16 位）│
 │ P | DPL | Type   （Present、權限、類型）      │
@@ -649,348 +1104,376 @@ Call Gate 也是一個 descriptor（8 bytes），但格式跟 segment descriptor
 └────────────────────────────────────────────┘
 ```
 
-| 欄位 | 說明 |
-|------|------|
-| **Selector** | 指向目標 code segment 的 selector（例如 Ring 0 的 kernel code segment） |
-| **Offset** | 目標函數在該 segment 裡的精確入口點 |
-| **DPL** | 誰有資格使用這個 Gate（例如 DPL=3 → Ring 3 可以用） |
-| **Dword Count** | 跨權限呼叫時，要從舊 stack 複製幾個 dword 參數到新 stack（0~31） |
+重要：CALL 指令裡寫的 offset 會被 CPU 忽略，CPU 只用 Gate 裡寫的 offset。所以你不能跳到 kernel 函數的中間。
 
-Gate 就像一個安全的函數指標：它同時指定「目標在哪」和「誰能用」。
+### 現代 OS 的替代方案
 
-重要：你的 CALL 指令裡寫的 offset 會被 CPU 忽略，CPU 只用 Gate 裡寫的 offset。所以你不能跳到 kernel 函數的中間去執行。
+現代 OS 不用 Call Gate 來做 system call，而是用更快的指令：
+- **Intel**: `sysenter` / `sysexit`（Pentium II+）
+- **AMD/通用**: `syscall` / `sysret`（x86-64）
 
-### 6.4 使用 Call Gate 時的四重權限檢查
+這些指令直接在 MSR 裡指定目標 CS 和 entry point，不需要查 GDT 中的 Gate descriptor，速度更快。
 
-透過 Call Gate 做 CALL 時，CPU 會同時檢查四個權限值：
+---
 
-```
-1. CPL        — 你現在的權限等級
-2. RPL        — selector 裡的 RPL
-3. Gate DPL   — Gate 本身的 DPL（「誰能用這個 Gate」）
-4. Target DPL — 目標 code segment 的 DPL（「目標的權限等級」）
+## 26. Conforming Code Segment 到底是什麼？
 
-CALL 的規則：
-  MAX(CPL, RPL) <= Gate DPL     （你有資格使用這個 Gate 嗎？）
-  AND
-  Target DPL <= CPL              （目標權限必須 >= 你的權限，即只能提升不能降低）
-```
+### 定義
 
-舉例：
+Conforming segment（C=1）允許**低權限的程式直接 JMP/CALL 進來**，但 CPL 不會改變。
 
 ```
-場景：Ring 3 的程式透過 Call Gate 呼叫 Ring 0 的 kernel 函數
+非 Conforming（C=0）：
+  DPL 必須 = CPL → 只有同權限能跳進來
+  不符合就 General Protection Fault
 
-CPL = 3, RPL = 3, Gate DPL = 3, Target DPL = 0
-
-檢查 1：MAX(3, 3) = 3 <= 3（Gate DPL）→ 你可以用這個 Gate ✓
-檢查 2：0（Target DPL）<= 3（CPL）    → 目標權限比你高，合理 ✓
-→ 允許，CPL 變成 0
+Conforming（C=1）：
+  DPL ≤ CPL → 權限比你高或相等都可以跳進來
+  但 CPL 維持不變（你的權限不會提升）
 ```
 
+### 「ignore DPL」vs「abide by DPL」的困惑
+
+有些資料寫：
+- C=0 → "ignore descriptor privilege level"
+- C=1 → "abide by privilege level"
+
+這不是跟上面說的相反嗎？
+
+**其實是不同角度**：
+
+- **C=0（non-conforming）**：DPL 必須嚴格等於 CPL。如果不等，不管差多少都拒絕。從「DPL 作為門檻」的角度看，DPL 沒有作為一個「門檻」在運作——它只是一個等號比較，所以說「ignore（不把 DPL 當作有意義的門檻）」。
+- **C=1（conforming）**：DPL 作為一個**真正的門檻**（DPL ≤ CPL），意思是「你的權限至少要等於 DPL 才能進來」。DPL 發揮了閾值的作用，所以說「abide by（遵守 DPL 作為門檻的規定）」。
+
+### 用途
+
 ```
-場景：Ring 3 的程式想用一個只給 Ring 1 用的 Gate
+場景：共用的數學函式庫（sin, cos, sqrt）放在 Ring 0 的 conforming segment
 
-CPL = 3, Gate DPL = 1
+Ring 3 的程式呼叫 sin() → ✅ 允許
+  CPL 還是 3（不會變成 0）
+  sin() 裡面如果嘗試做 Ring 0 的事 → ❌ 被拒絕（CPL 還是 3）
 
-檢查 1：MAX(3, ?) <= 1 → 3 > 1，你沒資格用這個 Gate ✗
-→ General Protection Fault
-```
-
-**JMP 透過 Gate 的規則不同：**
-
-JMP 不能提升權限。透過 Gate 做 JMP 只能跳到 DPL = CPL 的 segment，或者 conforming segment。想提升權限必須用 CALL。
-
-```
-CALL 透過 Gate → 可以提升權限（CPL 變小）
-JMP 透過 Gate  → 不能提升權限（目標 DPL 必須 = CPL，或 conforming）
+vs Call Gate：
+  Call Gate 呼叫 → CPL 真的變成 0（權限提升了）
+  Conforming 呼叫 → CPL 維持 3（只是借用程式碼）
 ```
 
 ---
 
-## 7. Stack Switching（堆疊切換）
+## 27. Segment Register 的類型限制
 
-### 7.1 為什麼要切換 Stack
+### 每個 Segment Register 接受的 Descriptor 類型
 
-當 Ring 3 透過 Call Gate 進入 Ring 0 時，CPU 會自動切換到一個新的 stack。
+| Segment Register | 接受的類型 | 原因 |
+|---|---|---|
+| **CS** | Code segment only（S=1, E=1） | CS 是用來執行指令的，只有 code 能執行 |
+| **SS** | Writable data segment only（S=1, E=0, W=1） | Stack 需要 push/pop（讀+寫），不能是 code，不能是 read-only |
+| **DS, ES, FS, GS** | Data segment 或 readable code segment | 讀取資料用，code segment 需要 R=1 |
 
-為什麼？因為 Ring 3 的 stack 是使用者控制的。如果 kernel 繼續用 Ring 3 的 stack：
+### SS 不能是 System Descriptor
+
+SS 絕對不能是 S=0（system descriptor）。System descriptor 描述的是 TSS、Gate 等特殊結構，不是一塊可以讀寫的記憶體。Stack 需要的是一塊可以 push/pop 的記憶體，只有 writable data segment 才行。
+
+### SS 不能是 Code Segment
+
+Code segment 永遠不可寫（CPU 硬性規定）。Stack 需要寫入（push），所以 SS 不能指向 code segment。
+
+---
+
+## 28. 指令執行時的完整流程
+
+### 階段一：載入 Selector 到 Segment Register
+
+當你執行 `mov ds, ax`（或 far jmp 修改 CS）時：
 
 ```
-攻擊場景 1：
-  惡意程式把自己的 stack pointer 指到一個奇怪的位址
-  呼叫 system call 進入 kernel
-  Kernel 做 push → 寫到惡意程式指定的位址 → 記憶體被覆蓋！
-
-攻擊場景 2：
-  惡意程式把 stack 弄到只剩 2 bytes
-  Kernel 一 push 就 stack overflow → 當機或被利用
+1. CPU 讀取 selector 的 Index 和 TI bit
+2. 根據 TI bit 去 GDT（TI=0）或 LDT（TI=1）
+3. 檢查 Index 是否在 table limit 範圍內 → 否則 GP Fault
+4. 讀取 8-byte descriptor
+5. 檢查 P bit（Present）→ P=0 則 Not Present Fault
+6. Type Checking → 類型對不對（例如 CS 只接受 code）
+7. Privilege Checking → DPL >= MAX(CPL, RPL)
+8. 全部通過 → 把 Base、Limit、Access Rights 存入 segment register 的隱藏部分（cache）
 ```
 
-所以每個權限等級都需要自己的、被信任的 stack。
+所有的「重量級檢查」在這一步完成。之後的記憶體存取就用 cache 裡的資訊。
 
-### 7.2 TSS（Task State Segment）
+### 階段二：使用 Segment Register 存取記憶體
 
-每個權限等級的 stack pointer 存在 TSS（Task State Segment）裡：
+當你執行 `mov eax, [ds:0x1234]` 時：
 
 ```
-TSS 裡相關的部分：
+1. CPU 從 DS 的 cache 讀取 Base、Limit、Type
+2. Limit Checking → offset 0x1234 是否在 limit 範圍內
+3. Type Checking → 這次操作跟 segment type 相容嗎（讀/寫/執行）
+4. 計算線性位址 = Base + Offset
+5. 如果啟用 Paging → 線性位址經過 page table 轉換為物理位址
+   → Page table 的 U/S bit 檢查（依據 CPL）
+   → Page table 的 R/W bit 檢查
+6. 最終存取物理記憶體
+```
 
+```
+                    ┌─────────────┐
+                    │ 載入 Selector │
+                    └──────┬──────┘
+                           │
+            ┌──────────────┼──────────────┐
+            │              │              │
+        GDT 查表     Type Check    Privilege Check
+            │              │              │
+            └──────────────┼──────────────┘
+                           │
+                    ┌──────┴──────┐
+                    │ Cache 到     │
+                    │ Hidden Part  │
+                    └──────┬──────┘
+                           │
+                    ┌──────┴──────┐
+                    │ 記憶體存取   │
+                    └──────┬──────┘
+                           │
+            ┌──────────────┼──────────────┐
+            │              │              │
+       Limit Check    Type Check    Base + Offset
+            │              │              │
+            └──────────────┼──────────────┘
+                           │
+                    ┌──────┴──────┐
+                    │   Paging    │（如果啟用）
+                    │  U/S, R/W  │
+                    └──────┬──────┘
+                           │
+                    ┌──────┴──────┐
+                    │  物理記憶體  │
+                    └─────────────┘
+```
+
+---
+
+# Part 6: Stack 與 TSS
+
+---
+
+## 29. SS、ESP、EBP 的關係
+
+### SS（Stack Segment）
+
+SS 指向 stack 所在的 segment。在 flat model 下，SS 的 base = 0、limit = 4GB，所以 SS 幾乎透明——ESP 的值就是 stack 的線性位址。
+
+### ESP（Extended Stack Pointer）
+
+ESP 指向 **stack 的頂端**（最後一個被 push 的值的位址）。
+
+```
+push eax → ESP -= 4，然後把 eax 寫到 [SS:ESP]
+pop eax  → 從 [SS:ESP] 讀值到 eax，然後 ESP += 4
+```
+
+Stack 是從高位址往低位址長的。push 讓 ESP 變小，pop 讓 ESP 變大。
+
+### EBP（Extended Base Pointer）
+
+EBP 是 **stack frame 的基準點**。在函數呼叫時，EBP 指向當前 function 的 stack frame 底部，用來存取函數參數和區域變數：
+
+```
+呼叫 foo(1, 2) 前的 stack：
+
+高位址
 ┌──────────────┐
-│ SS0 : ESP0   │  ← Ring 0 的 stack（SS 和 ESP）
-│ SS1 : ESP1   │  ← Ring 1 的 stack
-│ SS2 : ESP2   │  ← Ring 2 的 stack
-│ ...其他欄位   │
+│      2       │  [EBP+12]  ← 第二個參數
+│      1       │  [EBP+8]   ← 第一個參數
+│  Return Addr │  [EBP+4]   ← CALL 自動 push 的
+│  舊的 EBP    │  [EBP]     ← 函數開頭 push ebp 保存的
+│  local var 1 │  [EBP-4]   ← 區域變數
+│  local var 2 │  [EBP-8]   ← 區域變數
+│              │  ← ESP（stack 頂端）
+低位址
+```
+
+典型的函數開頭（function prologue）：
+
+```asm
+push ebp          ; 保存呼叫者的 EBP
+mov ebp, esp      ; EBP = 當前 stack 頂端（作為基準點）
+sub esp, 8        ; 預留 8 bytes 給區域變數
+```
+
+函數結尾（function epilogue）：
+
+```asm
+mov esp, ebp      ; 回收區域變數的空間
+pop ebp           ; 恢復呼叫者的 EBP
+ret               ; 返回（pop EIP）
+```
+
+### 三者的關係
+
+- **SS** 決定 stack 在哪個 segment（flat model 下不重要）
+- **ESP** 隨著 push/pop 動態移動，永遠指向 stack 頂端
+- **EBP** 在函數內部固定不動，作為存取參數和區域變數的錨點
+
+---
+
+## 30. Stack Switching 與 TSS
+
+### 為什麼要切換 Stack？
+
+Ring 3 的 stack 是使用者控制的。如果 kernel 繼續用 Ring 3 的 stack：
+
+```
+攻擊 1：惡意程式把 stack pointer 指到 kernel 記憶體 → push 會覆蓋 kernel 資料
+攻擊 2：惡意程式把 stack 弄到快滿 → kernel push 造成 stack overflow
+```
+
+所以每個權限等級需要自己的、被信任的 stack。
+
+### TSS 存放的 Stack 資訊
+
+```
+TSS：
+┌──────────────┐
+│ SS0 : ESP0   │  ← Ring 3 → Ring 0 時用的 stack
+│ SS1 : ESP1   │  ← Ring 3 → Ring 1 時用的 stack
+│ SS2 : ESP2   │  ← Ring 3 → Ring 2 時用的 stack
 └──────────────┘
-
-注意：沒有 SS3:ESP3
-因為 Ring 3 是最低權限，不會有「從更低權限呼叫 Ring 3」的情況。
-Ring 3 的 stack 就是程式自己的 stack。
+沒有 SS3:ESP3（Ring 3 是最低權限，不會有更低的權限呼叫它）
 ```
 
-每個 task（process）有自己的 TSS，所以每個 process 有自己的 Ring 0 stack。TSS 由 OS 在建立 task 時設定好。這些初始 stack pointer 是唯讀的——CPU 只讀取，不會在執行中修改它們。
-
-### 7.3 完整的 Interlevel CALL 過程
-
-當 Ring 3 透過 Call Gate 呼叫 Ring 0 的函數時，CPU 自動執行以下步驟：
+### Interlevel CALL 的完整步驟
 
 ```
-Step 1: 確定新的權限等級
-  新 CPL = 目標 code segment 的 DPL = 0
+Ring 3 透過 Call Gate 呼叫 Ring 0：
 
-Step 2: 從 TSS 載入新的 stack
-  新 SS = SS0（TSS 裡的）
-  新 ESP = ESP0（TSS 裡的）
-  CPU 會檢查新 stack segment 的 DPL 是否 = 新 CPL
-  如果不是 → Stack Fault
+Step 1: 從 TSS 讀取 SS0:ESP0
+Step 2: 切換到新 stack（SS=SS0, ESP=ESP0）
+Step 3: Push 舊的 SS:ESP 到新 stack
+Step 4: 複製參數（Gate 的 Dword Count 指定數量）
+Step 5: Push 舊的 CS:EIP（返回位址）
+Step 6: 載入新的 CS:EIP（Gate 指定的入口）
+Step 7: CPL 變成 0
 
-Step 3: 驗證新 stack 有足夠空間
-  需要空間 = 舊 SS:ESP (8 bytes) + 參數 (N×4 bytes) + 返回 CS:EIP (8 bytes)
-  如果不夠 → Stack Fault (error code 0)
-
-Step 4: 把舊的 SS:ESP 壓到新 stack
-  ┌────────────┐
-  │  舊 SS     │  push（保存，以便 RET 時切回）
-  │  舊 ESP    │  push
-  └────────────┘
-
-Step 5: 複製參數
-  把 Call Gate 的 Dword Count 指定數量的參數，從舊 stack 複製到新 stack
-  ┌────────────┐
-  │  舊 SS     │
-  │  舊 ESP    │
-  │  參數 1    │  ← 從舊 stack 複製來的
-  │  參數 2    │
-  │  ...       │
-  └────────────┘
-
-Step 6: 壓入返回位址
-  ┌────────────┐
-  │  舊 SS     │
-  │  舊 ESP    │
-  │  參數 1    │
-  │  參數 2    │
-  │  舊 CS     │  ← 返回位址
-  │  舊 EIP    │  ← CALL 的下一條指令
-  └────────────┘ ← 最終的 ESP
-
-Step 7: 載入新的 CS:EIP
-  CS = Gate 裡指定的 selector
-  EIP = Gate 裡指定的 offset
-  CPL = 0（切換到 Ring 0 了！）
+新 stack 的內容：
+┌──────────────┐
+│  舊 SS       │
+│  舊 ESP      │
+│  參數 1      │  ← 從舊 stack 複製
+│  參數 2      │
+│  舊 CS       │  ← 返回位址
+│  舊 EIP      │
+└──────────────┘ ← ESP
 ```
 
-如果參數超過 31 個 dword 怎麼辦？Call Gate 的 count 欄位只有 5 bits，最多 31 個 dword。如果需要更多參數，被呼叫的函數可以透過新 stack 上保存的「舊 SS:ESP」去舊 stack 上讀取剩餘的參數。
-
-重要：CPU 不驗證參數的值。它只是盲目複製。被呼叫的 kernel 函數必須自己檢查每個參數是否合法。
-
-### 7.4 Interlevel RET（返回）
-
-當 Ring 0 的函數執行 `ret` 要回到 Ring 3 時：
-
-```
-Step 1: 從 stack 彈出 CS:EIP
-  CPU 看到 CS 的 RPL = 3 > 當前 CPL = 0 → 這是一個 interlevel return
-
-Step 2: 大量的權限檢查（見下表）
-
-Step 3: 從 stack 彈出 SS:ESP，恢復到 Ring 3 的 stack
-
-Step 4: 檢查 DS、ES、FS、GS
-  如果這些 register 裡的 selector 指向 DPL < 新 CPL 的 segment
-  （也就是指向比你新權限更高的 segment）
-  → 自動清成 NULL selector
-
-  為什麼？因為你已經降回 Ring 3 了，如果還留著 Ring 0 的 data selector，
-  Ring 3 的程式就能用它存取 Ring 0 的資料 → 安全漏洞。
-  CPU 主動幫你清掉，避免洩漏。
-```
-
-RET 只能往低權限返回（數字變大），不能往高權限返回。你不能透過 RET 來提升權限。
-
-**Interlevel RET 的完整檢查清單：**
-
-| 檢查內容 | 失敗時觸發 |
-|---------|-----------|
-| ESP 在當前 SS 範圍內 | Stack Fault |
-| ESP+7 在當前 SS 範圍內 | Stack Fault |
-| 返回 CS 的 RPL > 當前 CPL | GP Fault |
-| 返回 CS selector 不是 null | GP Fault |
-| 返回 CS 在 descriptor table 範圍內 | GP Fault |
-| 返回 CS descriptor 是 code segment | GP Fault |
-| 返回 CS segment present = 1 | Not Present |
-| 非 conforming：DPL = RPL；conforming：DPL <= RPL | GP Fault |
-| ESP+N+15 在 SS 範圍內（N = ret 指令的 immediate） | Stack Fault |
-| 恢復的 SS selector 不是 null | GP Fault |
-| 恢復的 SS 在 descriptor table 範圍內 | GP Fault |
-| 恢復的 SS 是可寫的 data segment | GP Fault |
-| 恢復的 SS segment present = 1 | Stack Fault |
-| 恢復的 SS DPL = 返回 CS 的 RPL | GP Fault |
-| 恢復的 SS selector RPL = SS DPL | GP Fault |
+返回時（`ret`），CPU 自動反向操作：pop CS:EIP、跳過參數、pop SS:ESP，恢復到 Ring 3 的 stack。
 
 ---
 
-## 8. Instruction Restriction（指令限制）
-
-### 8.1 Privileged Instructions（特權指令）
-
-以下指令只有 CPL = 0 時才能執行，否則 CPU 觸發 General Protection Fault：
-
-| 指令 | 用途 |
-|------|------|
-| `LGDT` | 載入 GDT 暫存器（設定 GDT 的位址和大小） |
-| `LIDT` | 載入 IDT 暫存器（設定中斷向量表） |
-| `LLDT` | 載入 LDT 暫存器 |
-| `LTR` | 載入 Task Register |
-| `LMSW` | 載入 Machine Status Word |
-| `MOV CRn` | 讀寫控制暫存器（CR0, CR2, CR3, CR4） |
-| `MOV DRn` | 讀寫 Debug 暫存器 |
-| `MOV TRn` | 讀寫 Test 暫存器 |
-| `CLTS` | 清除 Task-Switched Flag |
-| `HLT` | 停止 CPU 執行 |
-
-為什麼限制？因為這些指令可以改變整個系統的行為。如果 Ring 3 的程式能執行 `lgdt`，它就能替換 GDT，讓自己的 segment 變成 Ring 0 權限，整個保護機制就瓦解了。
-
-### 8.2 Sensitive Instructions（敏感指令）
-
-還有另一類指令（I/O 相關的，如 `in`、`out`、`cli`、`sti`），不是只限 Ring 0，而是透過 IOPL（I/O Privilege Level）來控制。EFLAGS 裡有一個 2-bit 的 IOPL 欄位，只有 CPL <= IOPL 時才能執行這些指令。
+# Part 7: 現代 OS 還用這些嗎？
 
 ---
 
-## 9. Pointer Validation Instructions（指標驗證指令）
+## 31. 現代 OS 中哪些機制還在用？
 
-這些指令讓 OS 可以在執行前先檢查 pointer 是否合法，避免觸發 fault。
+### Segmentation 相關
 
-### 9.1 LAR（Load Access Rights）
+| 機制 | 還用嗎？ | 說明 |
+|---|---|---|
+| GDT | ✅ | 必須存在，但只有少數 entries（kernel code/data, user code/data, TSS） |
+| LDT | ❌ | 幾乎不用（只有 Wine 等相容需要） |
+| Segment base/limit | ❌ | Flat model：base=0, limit=4GB，等於沒作用 |
+| FS/GS base | ✅ | FS 用於 thread-local storage，GS 用於 per-CPU data |
 
-```asm
-lar eax, selector    ; 把 selector 指向的 descriptor 的 access rights 載入 eax
-```
+### Descriptor 欄位
 
-檢查你有沒有權限看這個 descriptor。如果有，把 descriptor 的 access rights byte 載入目標暫存器，並設 ZF=1。如果沒權限，ZF=0，暫存器不改。
+| 欄位 | 還用嗎？ | 說明 |
+|---|---|---|
+| **S bit** | ✅ | GDT 裡混合 S=1（code/data）和 S=0（TSS），CPU 必須區分 |
+| **E bit** | ✅ | 區分 code 和 data segment（影響 CS 載入行為） |
+| **P bit** | ✅ | P=0 觸發 segment not present fault |
+| **DPL** | ✅ | 只用 0 和 3，配合 CPL 做基本的 kernel/user 區分 |
+| **L bit** | ✅ | Long Mode 新增，L=1 表示 64-bit code segment |
+| **D/B bit** | ✅ | 區分 32-bit 和 16-bit 模式 |
+| **G bit** | ✅ | 設成 4KB granularity 讓 limit = 4GB |
+| **C bit** | ❌ | Conforming segment 幾乎不用 |
+| **ED bit** | ❌ | Expand-down 幾乎不用 |
+| **R/W bit** | ❌ | Flat model 下 DS/ES/SS 共用同一個 writable data segment |
+| **A bit** | ❌ | Paging 的 Accessed bit 取代了 segment 的 A bit |
+| **RPL** | ❌ | Paging 的 U/S bit 提供了足夠的保護 |
 
-檢查規則：MAX(CPL, RPL) <= DPL（跟一般的資料存取檢查一樣）。Conforming code segment 例外：任何權限都能查。
+### System Descriptor
 
-所有有效的 descriptor 類型都支援 LAR 檢查。
+| 類型 | 還用嗎？ | 說明 |
+|---|---|---|
+| **TSS** | ✅ | 每個 CPU 一個，存放 RSP0（kernel stack pointer）和 IST |
+| **Interrupt Gate** | ✅ | IDT 中的中斷處理 entry |
+| **Trap Gate** | ✅ | IDT 中的例外處理 entry |
+| **Call Gate** | ❌ | 被 `syscall`/`sysenter` 取代 |
+| **Task Gate** | ❌ | 硬體 task switch 太慢，OS 用軟體做 context switch |
+| **LDT descriptor** | ❌ | 不用 LDT 就不需要 |
 
-### 9.2 LSL（Load Segment Limit）
+### 權限機制
 
-```asm
-lsl eax, selector    ; 把 selector 指向的 descriptor 的 limit 載入 eax
-```
+| 機制 | 還用嗎？ | 說明 |
+|---|---|---|
+| **CPL** | ✅ | 核心機制，paging 的 U/S 檢查依賴 CPL |
+| **Ring 0 / Ring 3** | ✅ | Kernel mode / User mode 的區分基礎 |
+| **Ring 1 / Ring 2** | ❌ | 從未被主流 OS 使用 |
+| **Privilege Instructions** | ✅ | `lgdt`、`mov cr0`、`hlt` 等仍然只有 Ring 0 能執行 |
+| **IOPL** | ✅ | 控制 I/O 指令和 cli/sti 的權限 |
 
-載入 segment 的 limit（已經根據 G bit 換算成 byte 為單位的 32-bit 值）。ZF 的行為跟 LAR 一樣。
+### 總結
 
-只能用在 segment 類型的 descriptor：
-
-| Type | 能用 LSL？ |
-|------|-----------|
-| Code/Data segment | YES |
-| Available 286/386 TSS | YES |
-| Busy 286/386 TSS | YES |
-| LDT | YES |
-| Call Gate | NO |
-| Task Gate | NO |
-| Interrupt/Trap Gate | NO |
-
-### 9.3 VERR / VERW（Verify for Reading / Writing）
-
-```asm
-verr selector    ; 如果這個 segment 在當前權限下可讀，ZF = 1
-verw selector    ; 如果這個 segment 在當前權限下可寫，ZF = 1
-```
-
-不會觸發任何 fault。只是設 ZF 告訴你結果。
-
-**VERR 的檢查：**
-1. selector 在 GDT/LDT 範圍內
-2. 指向 code 或 data segment（不是 system descriptor）
-3. segment 是可讀的
-4. 權限檢查通過（DPL >= MAX(CPL, RPL)，conforming 除外）
-
-**VERW 的檢查：**
-1. 同上 1、2
-2. segment 是可寫的 data segment
-3. 權限檢查通過
-
-Code segment 永遠不可寫，所以 VERW 對 code segment 一定回 ZF=0。
-
-### 9.4 ARPL（Adjust RPL）
-
-```asm
-arpl selector_reg, ax    ; 如果 selector_reg 的 RPL < ax 的 RPL，
-                         ; 就把 selector_reg 的 RPL 調高到 ax 的 RPL
-                         ; 調整了 → ZF=1；沒調整 → ZF=0
-```
-
-這是 RPL 防冒充機制的實作工具。OS 收到使用者傳來的 selector 後：
-
-```asm
-; OS 從 stack 取得呼叫者的 CS（知道呼叫者的 CPL）
-; 然後對使用者傳來的 selector 執行 ARPL
-arpl user_selector, caller_cs
-
-; 效果：確保 user_selector 的 RPL >= 呼叫者的 CPL
-; 如果使用者給了一個 RPL=0 的 selector（想冒充 kernel），
-; ARPL 會把它調高成 RPL=3（呼叫者真正的權限）
-; 這樣之後用這個 selector 時，CPU 會用 RPL=3 來做權限檢查
-```
+現代 OS 的保護機制主力是 **Paging**（page table 的 U/S、R/W、NX bit），segmentation 退化為 flat model，只保留最基本的 kernel/user 區分（透過 CPL）。但 GDT、TSS、IDT 等結構因為 CPU 硬體要求，仍然必須存在。
 
 ---
 
-## 10. 完整的大圖
+# Part 8: 參考資料
 
-```
-程式要存取記憶體
-    │
-    ▼
-segment register 裡有 selector
-    │
-    ▼
-CPU 查看 selector 的 Index → 去 GDT/LDT 找到 descriptor
-    │
-    ▼
-┌─────────────────────────────────────────────┐
-│ 檢查 1: Type Check                          │
-│   segment 類型對嗎？                          │
-│   （不能把 data 載入 CS，不能寫 code segment） │
-│                                              │
-│ 檢查 2: Privilege Check                      │
-│   你有權限嗎？                                │
-│   DPL >= MAX(CPL, RPL)？                     │
-│                                              │
-│ 檢查 3: Limit Check                          │
-│   offset 在有效範圍內嗎？                      │
-│   不能超過 Limit                              │
-└─────────────────────────────────────────────┘
-    │                    │
-    ▼                    ▼
-  全部通過             任一失敗
-    │                    │
-    ▼                    ▼
-  正常存取            CPU 觸發 Exception
-  Base + Offset       （GP Fault、Stack Fault、
-  = 實體位址            或 Not Present Fault）
-```
+---
 
-這就是 80386 Segment-Level Protection 的完整機制。每一次記憶體存取、每一次 JMP/CALL/RET，CPU 都在背後做這些檢查。全部由硬體自動完成，不需要一行軟體程式碼。
+## 32. References
+
+### Intel 官方手冊
+
+1. **Intel 80386 Programmer's Reference Manual (1986)**
+   - Section 2.1: Modes of Operation
+   - Section 2.5: Memory Management
+   - Section 5.1: Segment Translation / Descriptor Tables
+   - Section 6.3: Segment-Level Protection
+   - Section 10.3: Switching to Protected Mode
+   - Online: https://www.scs.stanford.edu/nyu/04fa/lab/i386/
+
+2. **Intel 64 and IA-32 Architectures Software Developer's Manual**
+   - Volume 2: Instruction Set Reference (MOV, LGDT, LMSW)
+   - Volume 3A, Chapter 3: Protected-Mode Memory Management
+   - Volume 3A, Chapter 4: Paging
+   - Volume 3A, Section 4.6: Access Rights
+   - Volume 3A, Chapter 7: Task Management (TSS)
+
+3. **Intel 80286 Programmer's Reference Manual (1985)**
+   - Real address mode and protected mode descriptions
+   - 6-byte descriptor format (with reserved bytes 6-7)
+
+### AMD 手冊
+
+4. **AMD64 Architecture Programmer's Manual, Volume 2**
+   - Section 1.2: Long Mode overview
+   - "In 64-bit mode, segmentation is disabled. The segment base is treated as zero."
+
+### 其他資源
+
+5. **Ralph Brown's Interrupt List**
+   - INT 10h (video services)
+   - INT 13h (disk services): "ES:BX -> buffer for data"
+
+6. **Linux Kernel Source Code**
+   - `arch/x86/kernel/cpu/common.c`: TSS initialization per CPU
+   - `arch/x86/include/asm/mmu_context.h`: LDT usage (minimal)
+   - `arch/x86/include/asm/segment.h`: GDT layout definitions
+
+7. **OSDev Wiki** (https://wiki.osdev.org)
+   - GDT Tutorial
+   - Protected Mode
+   - Setting Up Long Mode
