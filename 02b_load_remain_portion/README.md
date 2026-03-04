@@ -51,8 +51,18 @@
 **Part 7: 現代 OS 還用這些嗎？**
 31. [現代 OS 中哪些機制還在用？](#31-現代-os-中哪些機制還在用)
 
-**Part 8: 參考資料**
-32. [References](#32-references)
+**Part 8: GAS Intel Syntax 的陷阱**
+33. [OFFSET 關鍵字與 Label 的語意差異](#33-offset-關鍵字與-label-的語意差異)
+
+**Part 9: 記憶體管理演進：從 Segmentation 到 Paging**
+34. [8086 到 386 的記憶體管理演進](#34-8086-到-386-的記憶體管理演進)
+35. [External Fragmentation 與 Segmentation 的局限](#35-external-fragmentation-與-segmentation-的局限)
+36. [OS/2 的 Segment 管理 API](#36-os2-的-segment-管理-api)
+37. [Memory Model 與 Pointer 類型](#37-memory-model-與-pointer-類型)
+38. [Paging 如何解決 Segmentation 的問題](#38-paging-如何解決-segmentation-的問題)
+
+**Part 10: 參考資料**
+39. [References](#39-references)
 
 ---
 
@@ -328,7 +338,7 @@ read_self_all:
     mov ax, 0x240        ; AH=02（讀取功能），AL=0x40（讀 64 個 sectors = 32KB）
     mov dx, 0x80         ; DH=0（head 0），DL=0x80（第一顆硬碟）
     int 0x13
-    jc read_self_all     ; CF=1 表示失敗，重試
+    jc read_self_all     ; CF=1 表示失敗，重試。這個指令是jump if carry CF=1
 ```
 
 ### CHS 定址（Cylinder-Head-Sector）
@@ -465,7 +475,7 @@ Protected Mode（32-bit）
   │ 可用 4GB 記憶體
   │ 可啟用 paging
   │
-  │ ← 啟用 PAE → 設定 page tables → 設定 CR0.PG、EFER.LME → Far Jump
+  │ ← 啟用 PAE → 設定 page tables → 設定 CR0.PG、EFER.LME → Far Jump //CR0的paging必須要啟用pe，不然沒有效果
   ▼
 Long Mode（64-bit）
   │ 虛擬定址 256TB+
@@ -1429,11 +1439,303 @@ Step 7: CPL 變成 0
 
 ---
 
-# Part 8: 參考資料
+# Part 8: GAS Intel Syntax 的陷阱
 
 ---
 
-## 32. References
+## 33. OFFSET 關鍵字與 Label 的語意差異
+
+### 問題背景
+
+在除錯本專案時，發現進入 Protected Mode 後 GDT 未正確載入（GDTR base = 0x000000）。經過逐步排查，確認 INT 0x13 磁碟讀取的目標位址為 0，導致第二個 sector 的資料被載入到 0x0000 而不是 0x7E00。
+
+### 根本原因：GAS Intel Syntax 的 Label 語意
+
+GAS 的 `.intel_syntax noprefix` 模式模仿 MASM 的行為：**裸 label 被解讀為記憶體參考（dereference），而非立即值**。
+
+```asm
+mov bx, _start_32       ; GAS 解讀為：mov bx, [_start_32]（讀取記憶體）
+                         ; 機器碼：8B 1E xx xx（memory load）
+
+mov bx, OFFSET _start_32 ; GAS 解讀為：mov bx, _start_32 的地址值
+                         ; 機器碼：BB xx xx（immediate load）
+```
+
+這與 NASM 的行為相反。在 NASM 中，裸 label 就是立即值，要 dereference 必須加 `[]`（[NASM vs MASM syntax reference](https://www.nasm.us/xdoc/2.16.03/html/nasmdoc2.html)）。
+
+### 受影響的指令
+
+本專案中有兩行受影響：
+
+```asm
+mov esp, _start          ; ❌ 讀取 [0x7C00] 的值，而非載入 0x7C00
+mov bx, _start_32        ; ❌ 讀取 [0x7E00] 的值，而非載入 0x7E00
+```
+
+修正：
+
+```asm
+mov esp, OFFSET _start       ; ✅ esp = 0x7C00
+mov bx, OFFSET _start_32    ; ✅ bx = 0x7E00
+```
+
+### 不需要 OFFSET 的情況
+
+並非所有指令都需要加 OFFSET：
+
+| 指令 | 需要 OFFSET？ | 原因 |
+|---|---|---|
+| `mov reg, label` | **需要** | 否則變成 `mov reg, [label]` |
+| `jmp label` | 不需要 | jmp 的操作數永遠是地址 |
+| `lgdt [label]` | 不需要 | lgdt 本來就是從記憶體讀取 |
+| `call label` | 不需要 | call 的操作數永遠是地址 |
+
+### 除錯過程
+
+1. 使用 `objdump -d` 查看反組譯，發現 `mov bx, _start_32` 生成了 `8b 1e`（memory load opcode），而非 `bb`（immediate load opcode）
+2. 在 GDB 中用 `x/6xb 0x7E10` 檢查 gdt_desc 位址，發現全為零
+3. 確認 INT 0x13 因 BX=0 而將資料載入到 0x0000，而非 0x7E00
+4. 原始教材（02a）有相同的 bug，但因為 02a 載入後直接 `jmp .` 不使用載入的資料，所以 bug 未被觸發
+
+---
+
+# Part 9: 記憶體管理演進：從 Segmentation 到 Paging
+
+---
+
+## 34. 8086 到 386 的記憶體管理演進
+
+8086 的 CPU 就具備 segment 機制（CS、DS、ES、SS），但此時為 Real Mode，segment register 的值直接參與 physical address 的計算（segment × 16 + offset），沒有 descriptor 也沒有 paging，因此程式的記憶體操作直接對應 physical memory。offset 是 16-bit，最大值 0xFFFF = 64KB，所以即使 8086 有 1MB 的 address space，每次只能透過一個 segment register 看到其中 **64KB 的窗口**，要看另一段就必須更換 segment register 的值。在 8086 搭配 DOS 的時期，系統僅做單任務，所以多任務引起的 memory fragmentation 問題並不明顯（[Chen, 2020](https://devblogs.microsoft.com/oldnewthing/20200728-00/?p=104012)）。
+
+80286 的 CPU 引入了 Protected Mode 與 descriptor（GDT/LDT）機制，使得 segment 具備了 base、limit、access rights 等屬性，並且可執行多任務。理論上任何程式都認為其可以操作 GDT + LDT 的記憶體（(8192 + 8192) × 64KB = 1GB），descriptor 中的 P bit（Present）允許 segment 暫時不在實體記憶體中，實現了以 segment 為單位的 virtual memory。但實際上此 segment 機制搭配多任務後，external fragmentation 的問題會嚴重放大（見 [§35](#35-external-fragmentation-與-segmentation-的局限)）。
+
+80386 引入了 paging 機制，將記憶體以固定大小（4KB page）為單位管理，從根本上解決了 segmentation 的 external fragmentation 問題。386 團隊的設計調查發現「所有客戶都討厭 8086 的 segmented memory scheme，並且認為 286 是一個錯失的機會」（[XtoF, 2023](https://www.xtof.info/intel80386.html)），因此 386 將支援 flat memory 視為最高優先級。
+
+### 演進總覽
+
+| CPU | 年份 | 記憶體管理 | Virtual Memory |
+|---|---|---|---|
+| 8086 | 1978 | segment × 16 + offset | 無 |
+| 80286 | 1982 | descriptor（base + limit），segment 為單位 | 有（P bit，以 segment 為單位 swap） |
+| 80386 | 1985 | descriptor + paging（4KB page） | 有（以 page 為單位 swap） |
+
+---
+
+## 35. External Fragmentation 與 Segmentation 的局限
+
+### External Fragmentation
+
+在 segmentation 架構下，每個 segment 必須佔用**連續的 physical memory**（一個 base + 一段連續的 offset 範圍）。當多個不同大小的 segment 被分配和釋放後，physical memory 中會出現大小不一的空洞：
+
+```
+記憶體（external fragmentation）：
+  ┌──────┬──────┬──────┬──────┬──────┬──────┐
+  │ Seg A│ 空洞  │ Seg C│ 空洞 │ Seg E│ 空洞  │
+  │ 30KB │ 10KB │ 20KB │ 5KB  │ 40KB │ 15KB │
+  └──────┴──────┴──────┴──────┴──────┴──────┘
+```
+
+當程式需要連續的 50KB 時，空洞合計雖有 30KB（10 + 5 + 15），但沒有任一個連續空洞 ≥ 50KB，因此無法分配。即使做記憶體重整（compaction）將所有 segment 往一端靠攏，性能開銷也非常大（[Intel, 1987, §6.3](https://pdos.csail.mit.edu/6.828/2017/readings/i386/s06_03.htm)）。
+
+### Internal Fragmentation
+
+相對地，paging 使用固定大小的 page（4KB），每次分配都是 4KB 的倍數。如果程式只需要 5KB，就要分配 2 個 page（8KB），浪費 3KB。這種「分配單元內部的浪費」稱為 internal fragmentation。但因為 page 很小（4KB），浪費的量遠小於 segmentation 的問題。
+
+### Segmentation 的根本局限
+
+Segment 的設計天然要求每個 segment 佔用連續的 physical memory。這意味著：
+
+1. **分配困難**：需要找到夠大的連續空間
+2. **擴展困難**：segment 後面可能已被其他 segment 佔用，無法就地擴展
+3. **大小不一**：每個 segment 的 limit 不同，加劇了碎片化
+4. **超過 64KB 的資料需要切片**：程式必須自己處理跨 segment 的存取（見 [§36](#36-os2-的-segment-管理-api)）
+
+---
+
+## 36. OS/2 的 Segment 管理 API
+
+在 286 的 Protected Mode 下，OS 實際操作 LDT 中的 descriptor 來管理記憶體。以 OS/2 為例，提供了完整的 segment 管理 API。
+
+### DosAllocSeg — 分配單一 Segment
+
+[DosAllocSeg](https://www.edm2.com/index.php/DosAllocSeg) 接受 1~65536 bytes 的 Size 參數，OS 會在 LDT 中建立對應的 descriptor 並設定精確的 limit。
+
+```c
+// API 簽名
+DosAllocSeg(Size, Selector, AllocFlags)
+// Size: 1~65535（0 代表 65536）
+// Selector: 回傳分配到的 selector
+// AllocFlags: 共享/可丟棄等屬性
+```
+
+Intel 規格明確指出 descriptor 的 limit 欄位「defines the size of the segment」，且「the value of the limit is one less than the size (expressed in bytes) of the segment」（[Intel, 1987, §5.1](https://pdos.csail.mit.edu/6.828/2005/readings/i386/s05_01.htm)）。如果存取超過 limit 的 offset，CPU 觸發 General Protection Exception（[Intel, 1987, §6.3](https://pdos.csail.mit.edu/6.828/2017/readings/i386/s06_03.htm)）。osFree 專案的原始碼中可以看到實際的 descriptor limit 設定為 `(size - 1)`，而非固定 64KB（[osfree-project/os3, kal.c](https://github.com/osfree-project/os3)）：
+
+```c
+desc.limit_lo = (size - 1) & 0xffff;
+desc.limit_hi = (size - 1) >> 16;
+```
+
+### DosReallocSeg — 調整 Segment 大小
+
+[DosReallocSeg](http://www.osfree.org/doku/doku.php?id=en:docs:fapi:dosreallocseg) 能事後調整 segment 的大小，OS 會更新 descriptor 的 limit 欄位。因此 segment 的 limit 是**浮動的**——但最大值受限於 286 descriptor 的 16-bit limit 欄位，故上限為 64KB。
+
+### DosAllocHuge — 分配超過 64KB 的記憶體
+
+當程式需要超過 64KB 的連續資料時，必須使用多個 segment 來拼接。OS/2 提供了 [DosAllocHuge](https://www.edm2.com/index.php/DosAllocHuge) 來分配多個等間距的 segment。
+
+```c
+DosAllocHuge(NumSeg, Size, Selector, MaxNumSeg, AllocFlags)
+// NumSeg: 完整 64KB segment 的數量
+// Size: 最後一個 segment 的 bytes 數（"last (non-65536-byte) segment"）
+// Selector: 回傳第一個 segment 的 selector
+```
+
+以分配 200KB 為例（[Letwin, 1988, §9.2.2](https://gunkies.org/wiki/Inside_OS/2)）：
+
+```
+DosAllocHuge(3, 8192, ...)
+
+Selector n+0i  →  64KB  ← 第 0 個 segment
+Selector n+1i  →  64KB  ← 第 1 個 segment
+Selector n+2i  →  64KB  ← 第 2 個 segment
+Selector n+3i  →   8KB  ← 最後一個 segment（limit = 8191）
+
+i = 等間距值，每次開機可能不同，透過 DosGetHugeShift 取得
+```
+
+Gordon Letwin 在 *Inside OS/2* 中指出，這個 huge segment 的算法與 8086 的 segment 算術本質相同：在 Real Mode 下 `i` 固定為 4096（因為 segment × 16，4096 × 16 = 64KB），在 Protected Mode 下 `i` 由 OS 提供。程式碼的計算方式完全一樣，只是底層機制不同——Real Mode 的 selector 值直接對應 physical address，Protected Mode 的 selector 只是 LDT 的 index，由 OS 刻意安排等間距（[Letwin, 1988, §9.2.2](https://gunkies.org/wiki/Inside_OS/2)）。
+
+### 跨 Segment 存取的範例
+
+以下為 Microsoft KB Q73187 提供的 OS/2 MASM 程式碼範例，在 huge segment 中每隔 10000 個 byte 寫入 1（[Microsoft, 1991](https://jeffpar.github.io/kbarchive/kb/073/Q73187/)）：
+
+```asm
+.model huge, pascal, OS_OS2
+
+invoke DosAllocHuge, 1, 34464, addr selector, 0, SEG_NONSHARED
+invoke DosGetHugeShift, addr ShiftCount
+mov cx, ShiftCount
+shl i, cl                    ; i = selector 間距值
+
+mov ax, selector
+mov es, ax                   ; es = 第一個 segment 的 selector
+mov bx, 0
+mov dl, 1
+
+.while cx <= 10
+    mov es:[bx], dl          ; 寫入 1 byte
+    add bx, 10000            ; offset += 10000
+    inc cx                   ; inc 不影響 CF
+    jnc testcx               ; CF=0（未溢位）→ 跳過 segment 切換
+    mov ax, es
+    add ax, i                ; 切到下一個 segment
+    mov es, ax
+testcx:
+.endw
+```
+
+當 `add bx, 10000` 使 offset 溢位超過 0xFFFF 時，CF 被設為 1，程式將 `es` 加上間距值 `i` 以切換到下一個 segment。`inc cx` 不影響 CF（x86 設計），因此 `jnc` 判斷的是 `add` 的進位。
+
+---
+
+## 37. Memory Model 與 Pointer 類型
+
+### Pointer 類型
+
+16-bit x86 有三種指標類型，其區別在於如何處理 segment:offset 定址（[Chen, 2020](https://devblogs.microsoft.com/oldnewthing/20200728-00/?p=104012)）：
+
+| 類型 | 大小 | 內容 | 跨 segment？ |
+|---|---|---|---|
+| **near** | 16-bit | offset only | 不能，限於當前 segment 的 64KB |
+| **far** | 32-bit | segment + offset | 能跨 segment，但 offset 溢位時不自動處理 |
+| **huge** | 32-bit | segment + offset（正規化） | 能跨 segment，自動處理 offset 溢位 |
+
+Huge pointer 的正規化：將盡可能多的 bits 放進 segment，使 offset 永遠 < 16（[Chen, 2020](https://devblogs.microsoft.com/oldnewthing/20200728-00/?p=104012)）。例如 physical address `0x179B8`：
+
+```
+far pointer:  1234:5678  → 0x12340 + 0x5678 = 0x179B8（非唯一表示）
+huge pointer: 179B:0008  → 0x179B0 + 0x0008 = 0x179B8（唯一表示）
+```
+
+正規化確保每個 physical address 只有一種表示法，使指標比較正確。但 Raymond Chen 指出：「pointer arithmetic with huge pointers was computationally expensive, so you didn't use them much」（[Chen, 2020](https://devblogs.microsoft.com/oldnewthing/20200728-00/?p=104012)）。
+
+### Memory Model
+
+Memory model 決定程式**預設**使用哪種 pointer。這是**編譯器層面的決定**，不是 OS 決定的。OS 不知道也不在乎程式用了哪個 model（[Chen, 2020](https://devblogs.microsoft.com/oldnewthing/20200728-00/?p=104012)）。
+
+核心是一個 2×2 矩陣：
+
+| | Data = near | Data = far |
+|---|---|---|
+| **Code = near** | **Small** | **Compact** |
+| **Code = far** | **Medium** | **Large** |
+
+加上兩個特殊的：
+- **Tiny**：Code + Data 共用同一個 64KB segment（`.COM` 檔案格式）
+- **Huge**：跟 Large 相同（far code + far data），但額外支援單一資料結構超過 64KB
+
+不論選擇哪個 model，程式都可以手動 override 單一變數的 pointer 類型。例如在 Small model 裡宣告 `far` 指標（[Bumbershoot Software, 2022](https://bumbershootsoft.wordpress.com/2022/08/05/memory-models-and-far-pointers/)）。
+
+### Far Pointer 比較的陷阱
+
+當時的 16-bit C 編譯器（Turbo C、Microsoft C）對 far pointer 的 `<`、`<=`、`>`、`>=` **只比較 offset，忽略 segment**。只有 `==` 和 `!=` 才比較完整的 segment:offset。這導致 bounds checking 完全失效（[Chen, 2020](https://devblogs.microsoft.com/oldnewthing/20200728-00/?p=104012)）：
+
+```c
+// p = 1000:0100（buffer 起點），N = 0x200
+// q = 2000:0200（完全不在 buffer 裡！physical 差了 64KB）
+if (p <= q && q <= p + N) {
+    // 編譯器只比 offset：0x0100 <= 0x0200 <= 0x0300 → 全部通過！
+    // 但 q 根本不在 buffer 裡
+}
+```
+
+### 為什麼 386 Paging 消滅了 Memory Model
+
+386 的 flat model（base=0, limit=4GB）加上 paging 後，所有 pointer 都是 32-bit near pointer，統一指向同一個 4GB address space。不再需要區分 near/far/huge，也不再需要選擇 memory model。Raymond Chen 提到，`windows.h` 至今仍定義著 `NEAR` 和 `FAR` 巨集，但它們被定義為空白，只為了舊程式碼的向後相容（[Chen, 2020](https://devblogs.microsoft.com/oldnewthing/20200728-00/?p=104012)）。
+
+---
+
+## 38. Paging 如何解決 Segmentation 的問題
+
+### 核心差異：連續 vs 非連續
+
+| | Segmentation | Paging |
+|---|---|---|
+| 分配單位 | 可變大小的 segment | 固定大小的 page（4KB） |
+| Physical memory | 必須連續 | **不需要連續** |
+| 碎片類型 | External fragmentation（嚴重） | Internal fragmentation（輕微，最多浪費 4095 bytes） |
+| 虛擬 → 實體映射 | segment base + offset | page table 逐 page 映射 |
+
+### 為什麼 Page 不需要連續的 Physical Memory？
+
+Page table 為每個 virtual page 提供獨立的映射。例如程式認為自己擁有連續的 128KB 記憶體，但 physical memory 可以是分散的：
+
+```
+Virtual Address          Page Table          Physical Address
+┌────────────┐         ┌──────────┐
+│ Page 0     │ ───────→│ Frame 7  │ ──→ 0x7000
+│ 0x0000     │         │          │
+├────────────┤         ├──────────┤
+│ Page 1     │ ───────→│ Frame 2  │ ──→ 0x2000
+│ 0x1000     │         │          │
+├────────────┤         ├──────────┤
+│ Page 2     │ ───────→│ Frame 15 │ ──→ 0xF000
+│ 0x2000     │         │          │
+└────────────┘         └──────────┘
+
+程式看到連續的 0x0000~0x2FFF
+Physical memory 實際分散在 0x7000、0x2000、0xF000
+```
+
+這就是 paging 消除 external fragmentation 的根本原因——不再需要尋找連續的 physical memory 空間。
+
+---
+
+# Part 10: 參考資料
+
+---
+
+## 39. References
 
 ### Intel 官方手冊
 
@@ -1477,3 +1779,54 @@ Step 7: CPL 變成 0
    - GDT Tutorial
    - Protected Mode
    - Setting Up Long Mode
+
+### 記憶體管理與 Memory Model 相關
+
+8. **Raymond Chen, "A look back at memory models in 16-bit MS-DOS" (2020)**
+   - Memory model 的 2×2 矩陣、near/far/huge pointer、far pointer 比較的陷阱
+   - https://devblogs.microsoft.com/oldnewthing/20200728-00/?p=104012
+
+9. **Gordon Letwin, *Inside OS/2*, Microsoft Press (1988)**
+   - Section 9.2.2: Huge Memory — DosAllocHuge 的設計、selector 等間距排列、Real Mode vs Protected Mode 的對比
+   - Online: https://gunkies.org/wiki/Inside_OS/2
+   - Internet Archive: https://archive.org/details/InsideOS2GordonLetwin
+
+10. **Bumbershoot Software, "Memory Models and Far Pointers" (2022)**
+    - 6 種 memory model 的表格、Amiga 上的類似模式
+    - https://bumbershootsoft.wordpress.com/2022/08/05/memory-models-and-far-pointers/
+
+11. **XtoF, "Intel 80386, a revolutionary CPU" (2023)**
+    - 386 團隊的設計調查：「所有客戶都討厭 segmented memory scheme」
+    - https://www.xtof.info/intel80386.html
+
+### OS/2 API 文件
+
+12. **EDM2 — DosAllocSeg**
+    - Size 參數 1~65536 bytes，OS 設定精確的 descriptor limit
+    - https://www.edm2.com/index.php/DosAllocSeg
+
+13. **EDM2 — DosAllocHuge**
+    - 分配多個等間距 segment，最後一個 segment 為 "non-65536-byte segment"
+    - https://www.edm2.com/index.php/DosAllocHuge
+
+14. **osFree Wiki — DosReallocSeg**
+    - 事後調整 segment 大小，OS 更新 descriptor limit
+    - http://www.osfree.org/doku/doku.php?id=en:docs:fapi:dosreallocseg
+
+15. **Microsoft KB Q73187 — Using Huge Memory Model and Huge Arrays in MASM**
+    - OS/2 MASM 程式碼範例，跨 segment 存取
+    - https://jeffpar.github.io/kbarchive/kb/073/Q73187/
+
+16. **osfree-project/os3 (GitHub)**
+    - `shared/app/os2app/kal/kal.c`: descriptor limit 設定為 `(size - 1)`，證明 limit 是浮動的
+    - https://github.com/osfree-project/os3
+
+### GAS Syntax 相關
+
+17. **NASM Documentation, Section 2**
+    - NASM vs MASM 的 label 語意差異
+    - https://www.nasm.us/xdoc/2.16.03/html/nasmdoc2.html
+
+18. **Microsoft MASM .MODEL directive**
+    - Memory model 的正式規格
+    - https://learn.microsoft.com/en-us/cpp/assembler/masm/dot-model?view=msvc-170
