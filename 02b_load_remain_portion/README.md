@@ -1731,11 +1731,605 @@ Physical memory 實際分散在 0x7000、0x2000、0xF000
 
 ---
 
+## 39. Paging 之後的 Fragmentation——為什麼問題沒有消失
+
+### Paging 解決的是哪一層？
+
+Paging 解決的是 **OS 分配 physical frame 給 process** 這一層的 external fragmentation。Page table 讓每個 4KB virtual page 可以映射到任意 physical frame，所以 OS 不需要找連續的 physical memory。但程式不會每次需要記憶體時都向 OS 要一整個 4KB page——中間還有一層 **heap allocator**（`malloc`/`free`）。
+
+### 兩層架構
+
+```
+應用程式:   malloc(24)  malloc(64)  free(...)  malloc(128)
+              │
+         ┌────▼─────────────────────────────┐
+ Layer 2 │  Heap Allocator (malloc/free)    │  ← 在 virtual address space 內
+         │  管理 page 內部的 bytes 級分配     │     管理次級分配
+         └────┬─────────────────────────────┘
+              │  需要更多 page 時才呼叫
+         ┌────▼─────────────────────────────┐
+ Layer 1 │  OS Paging (mmap/brk)           │  ← 以 4KB page 為單位
+         │  virtual page → physical frame   │     無 external fragmentation
+         └──────────────────────────────────┘
+```
+
+### Heap-Level External Fragmentation
+
+在 Layer 2 中，allocator 拿到的是連續的 virtual address space，它要在裡面切割出不同大小的 block 給應用程式。經過多次 `malloc`/`free` 後：
+
+```
+某個 page 的 virtual address 空間內部：
+┌──────┬──────┬──────┬──────┬──────┬──────┐
+│ 24B  │ free │ 64B  │ free │ 32B  │ free │
+│ used │ 40B  │ used │ 16B  │ used │ 8B   │
+└──────┴──────┴──────┴──────┴──────┴──────┘
+```
+
+free 總共有 64B（40+16+8），但如果需要連續的 50B，沒有任何一個 free block 夠大。這就是 **heap-level external fragmentation**——跟 §35 描述的 segmentation 問題在本質上相同，只是發生的層級不同。
+
+### Paging 為什麼管不到這一層？
+
+Paging 的映射粒度是 4KB page。它保證 OS 可以把任意分散的 physical frame 拼成連續的 virtual space，但它不管 page 內部的 bytes 級別怎麼切。Heap allocator 在 virtual address space 裡做的事，本質上就是一個 variable-size allocation 問題——跟 segmentation 面對的問題結構完全一樣，只是：
+
+| | Segmentation 時代 | Paging 時代 |
+|---|---|---|
+| 發生層級 | Physical memory | Virtual address space（heap） |
+| 管理者 | OS | Allocator（`malloc`） |
+| 單位 | Segment（KB~MB） | Block（bytes~KB） |
+| 嚴重程度 | 嚴重（涉及 physical memory） | 較輕（只影響 virtual space，可以跟 OS 要更多 page） |
+
+Segmentation 時代的 fragmentation 是致命的——physical memory 就那麼多，碎片化後真的無法分配。Paging 時代的 heap fragmentation 嚴重程度較低，因為 allocator 空間不夠時可以向 OS 要更多 page（`brk`/`mmap`），virtual address space 通常遠大於 physical memory（32-bit 有 4GB，64-bit 有 128TB），且 physical memory 不足時可以透過 page swap 到 disk。但問題並沒有消失——在長時間運行的程式（如 server、database）中，heap fragmentation 仍然是實際的工程問題，這也是 `jemalloc`、`tcmalloc` 等專門 allocator 存在的原因。
+
+---
+
+## 40. Virtual Address Space Fragmentation 的意義
+
+### Physical 不連續不是問題，那 virtual 碎片化在說什麼？
+
+Physical memory 在 paging 架構下本來就不連續——page table 的設計就是接受這件事。所以 physical 不連續是正常狀態，不是問題。Virtual address space fragmentation 說的是另一件事：**有足夠的 free space 卻分配不出來**。
+
+程式呼叫 `malloc(100MB)` 時，回傳的 pointer 必須指向一段 **virtual address 連續**的空間，因為程式要用 pointer arithmetic 存取：
+
+```c
+int* arr = malloc(1000 * sizeof(int));
+arr[500] = 42;   // 編譯器算成 *(arr + 500)
+                  // 必須 virtual address 連續才能算
+```
+
+Physical 可以散在任何 frame，page table 會處理。但 virtual address 必須連續——這是 pointer arithmetic 的前提。Heap allocator 管理的就是這段 virtual address space，用久了之後碎片化的結果是：明明 free bytes 總量夠，卻找不到一段夠大的連續 virtual address range。
+
+### 為什麼不直接跟 OS 要新的 page？
+
+可以。Allocator 空間不夠時可以用 `brk`/`mmap` 要更多 page，這就是為什麼 heap fragmentation 不致命。但代價是：
+
+**1. 浪費 physical memory**
+
+舊的 page 裡有零碎的 used block 散布，整個 page 無法歸還 OS：
+
+```
+Page A（4KB）：
+┌──────────┬──────────────────────────────────┐
+│ 24B used │          4072B free              │
+└──────────┴──────────────────────────────────┘
+  ↑ 只剩這一小塊 used，但整個 page 不能還給 OS
+    因為這 24B 的 virtual address 還在被程式持有
+```
+
+每個這樣的 page 都佔一個 physical frame。Fragmentation 越嚴重，被「釘住」的 page 越多，浪費越多 RAM。
+
+**2. 32-bit 系統的 virtual address space 會用完**
+
+32-bit process 的 virtual space 只有 2~3GB。大量碎片化後，即使 free bytes 總量夠，也找不到連續的 virtual range：
+
+```
+32-bit virtual space（2GB）：
+┌─┬───┬─┬───┬─┬───┬─┬───┬─┬───┐
+│U│ F │U│ F │U│ F │U│ F │U│ F │   U=used, F=free
+└─┴───┴─┴───┴─┴───┴─┴───┴─┴───┘
+  free 總量 = 800MB
+  最大連續 free = 200MB
+  → malloc(500MB) 失敗
+```
+
+64-bit 系統的 virtual space 有 128TB，這個問題幾乎不存在。
+
+**3. 性能下降**
+
+碎片化代表同樣的資料分散在更多 page 上 → 佔用更多 TLB entry → 更多 TLB miss。
+
+### 總結
+
+```
+fragmentation ≠ 不連續
+fragmentation = 有足夠的 free space 卻分配不出來
+
+physical 不連續？→ 正常，paging 就是這樣設計的，不是問題
+virtual 不連續？ → 是問題，因為 pointer arithmetic 需要 virtual 連續
+```
+
+在 64-bit 系統上，virtual address space fragmentation 幾乎不是問題（空間太大了）。真正痛的是 physical memory 被碎片化的 page 釘住而浪費——這也是 buddy system（[§43](#43-buddy-system)）和 memory compaction（[§44](#44-對抗-kernel-level-fragmentation)）要解決的事。
+
+---
+
+## 41. 跨 Page 的存取
+
+### MMU 自動處理跨 Page Boundary 的存取
+
+當一筆存取（例如讀取一個 4-byte `int`）剛好落在 page boundary 上，CPU 需要做兩次 TLB lookup：
+
+```
+         Page N                    Page N+1
+    ┌───────────────┐         ┌───────────────┐
+    │       ... [2B]│         │[2B] ...       │
+    └───────────────┘         └───────────────┘
+    Physical Frame 7          Physical Frame 200
+```
+
+完整流程：
+
+```
+CPU 執行 mov eax, [0x1FFE]     （讀取 4 bytes，從 0x1FFE 到 0x2001）
+  │
+  ▼
+MMU 檢測到這次存取跨越了 page boundary
+  │  （0x1FFE~0x1FFF 在 Page 1，0x2000~0x2001 在 Page 2）
+  │
+  ▼
+MMU 自動拆成兩次 physical memory 存取：
+  ├─ Page 1 offset 0xFFE → 查 page table → Frame 7   → 讀 0x7FFE~0x7FFF（2 bytes）
+  └─ Page 2 offset 0x000 → 查 page table → Frame 200 → 讀 0xC8000~0xC8001（2 bytes）
+  │
+  ▼
+硬體拼接結果，放入 eax
+```
+
+程式寫 `int x = *(int*)0x1FFE;` 完全不需要知道 page boundary 在哪。OS 需要做的只有一件事：確保 Page 1 和 Page 2 的 page table entry 都是 valid 的。如果其中一個 page 被 swap 到 disk（Present bit = 0），CPU 會觸發 page fault，OS 才介入把那個 page 載回 physical memory。
+
+### 性能問題
+
+雖然硬體透明處理了跨 page 存取，但性能損失是真實的：
+
+**TLB miss**：每切換一個 page 就需要一次 TLB lookup。TLB 是有限的（典型 64~1024 entries），如果資料量大，會產生 TLB miss，要做 page table walk（走多級 page table），代價很高。即使 virtual address 是連續的，如果 physical frame 分散，也會降低 cache locality——DRAM 的 row buffer 預取是基於 physical address 的連續性。
+
+這是 Linux kernel 提供 **huge page**（2MB / 1GB）的原因——用更大的 page 來減少 TLB entries 的消耗。Allocator 和 compiler 也會做 **alignment**，盡量讓資料結構不跨 page boundary。
+
+---
+
+## 42. Kernel 為什麼需要 Physically Contiguous Memory
+
+Paging 的透明轉換靠的是 MMU。但有些場景 MMU 介入不了。
+
+### DMA——硬體繞過 MMU
+
+```
+CPU 存取記憶體：
+  CPU → Virtual Addr → [MMU/Page Table] → Physical Addr → DRAM
+                        ^^^^^^^^^^^^^^^^
+                        有翻譯，不需要連續
+
+DMA 設備存取記憶體：
+  網卡/磁碟控制器 → Physical Addr → DRAM
+                    ^^^^^^^^^^^^
+                    沒有 MMU，直接用 physical address
+```
+
+網卡要把收到的封包 DMA 寫入一塊 buffer。它拿到的是 physical address，不經過 page table。如果 OS 給它的 buffer 是 physical 不連續的 Frame 7 和 Frame 200，網卡不知道怎麼「跳」到 Frame 200——它只會從 Frame 7 一路往 Frame 8 寫下去，覆蓋別人的資料。所以 DMA buffer 必須 physically contiguous（現代有 IOMMU 可以幫設備做地址翻譯，也有 scatter-gather DMA 可以給設備一個 physical fragment list，但不是所有硬體都支援，且有額外開銷）。
+
+### Kernel 的 Direct Mapping
+
+Linux kernel 把整個 physical memory 做了一個 identity mapping（直接映射）：
+
+```
+Kernel Virtual Address Space:
+┌─────────────────────────────────┐ 0xFFFFFFFF
+│  vmalloc 區域（非連續映射）        │
+├─────────────────────────────────┤
+│  Direct Mapping 區域             │
+│  virtual = physical + PAGE_OFFSET│
+│  例如：virtual 0xC0001000        │
+│      = physical 0x00001000       │
+├─────────────────────────────────┤ PAGE_OFFSET (e.g. 0xC0000000)
+│  User Space                     │
+└─────────────────────────────────┘ 0x00000000
+```
+
+在 direct mapping 區域中，virtual 連續 = physical 連續。`kmalloc` 從這個區域分配，所以 virtual-to-physical 轉換只需要加減一個固定常數，極快，且不需要額外的 page table entry 操作——但代價就是要求 physical 連續。
+
+### kmalloc vs vmalloc
+
+Kernel 有兩套分配器。`kmalloc` 從 direct mapping 區域分配，physical 連續，分配速度快（buddy system 直接拿），VA↔PA 轉換只需加減常數，TLB 壓力低（direct mapping 用大頁），且 DMA 可用。`vmalloc` 透過 page table 做非連續映射，physical 不需要連續，但分配慢（要修改 page table、flush TLB），每次 VA↔PA 轉換要走 page table walk，TLB 壓力高（每個 page 需要獨立 TLB entry），且不能直接用於 DMA。
+
+| | `kmalloc` | `vmalloc` |
+|---|---|---|
+| Physical 連續 | 是 | 否 |
+| 分配速度 | 快（buddy system 直接拿） | 慢（要修改 page table、flush TLB） |
+| VA ↔ PA 轉換 | 加減常數 | 走 page table walk |
+| TLB 壓力 | 低（direct mapping 用大頁） | 高（每個 page 需要獨立 TLB entry） |
+| DMA 可用 | 可以 | 不行（除非 scatter-gather） |
+
+Kernel 是整個系統最頻繁操作記憶體的部分，如果每次分配都要改 page table 和 flush TLB，性能損失太大。所以小型、頻繁的 kernel 分配都走 `kmalloc`。而 `kmalloc` 要求 physical 連續，就退回到了需要找 contiguous physical frame 的老問題——用 **buddy system** 管理（見 [§43](#43-buddy-system)）。
+
+---
+
+## 43. Buddy System
+
+### 核心思想
+
+所有 block 的大小都是 **2 的冪次個 page**（1, 2, 4, 8, ... 1024 pages），用一組 free list 管理：
+
+```
+free_list[0]  →  1 page 的 free blocks
+free_list[1]  →  2 pages 的 free blocks
+free_list[2]  →  4 pages 的 free blocks
+free_list[3]  →  8 pages 的 free blocks
+...
+free_list[10] →  1024 pages (4MB) 的 free blocks
+```
+
+這些 free list 對應一棵二元樹，root 是整塊 physical memory，每次對半切：
+
+```
+                        ┌─────────────────────────────────┐
+            order 4     │           0 ~ 15                │  16 pages
+                        └────────────────┬────────────────┘
+                                         │ split
+                        ┌────────────────┴────────────────┐
+            order 3     │     0 ~ 7      │     8 ~ 15     │  8 pages
+                        └───────┬────────┴────────┬───────┘
+                                │ split           │ split
+                        ┌───────┴───────┐  ┌──────┴───────┐
+            order 2     │  0~3  │  4~7  │  │ 8~11 │ 12~15 │  4 pages
+                        └──┬────┴──┬────┘  └──┬───┴───┬───┘
+                           │       │          │       │
+                        ┌──┴──┐ ┌──┴──┐  ┌────┴─┐ ┌───┴──┐
+            order 1     │ 0~1 │ │ 2~3 │  │ 4~5  │ │ 6~7  │   ...
+                        └─┬─┬─┘ └──┬──┘  └──┬───┘ └──────┘
+                          │ │      │        │
+            order 0     [0] [1]  [2] [3]  [4] [5]  ...        1 page
+```
+
+同一個 parent 切出來的兩半互為 **buddy**。
+
+### 分配：向上取 2 的冪次，往上找，往下切
+
+需要的 page 數向上取最近的 2 的冪次：
+
+```
+需要的 pages    向上取 2 的冪次    order
+─────────────────────────────────────────
+  1               1               0
+  2               2               1
+  3               4               2
+  4               4               2
+  5               8               3
+  6               8               3
+  7               8               3
+  8               8               3
+  9              16               4
+```
+
+所以需要 3 pages 就分配 4 pages，浪費 1 page。需要 5 pages 就分配 8 pages，浪費 3 pages。這就是 buddy system 的 **internal fragmentation**——分配單位只能是 2 的冪次，不是剛好需要的大小。Linux 用 **slab allocator** 來緩解這個問題：先用 buddy system 拿整頁，再把頁內切成固定大小的小物件（32B, 64B, 128B...），減少浪費。
+
+以下用一個 16-page 的例子走完分配流程。
+
+**分配 A = 3 pages（需要 order 2，即 4 pages）：**
+
+`free_list[2]` 是空的，往上找 `free_list[3]` 也空，找到 `free_list[4]`：
+
+```
+Step 1: 從 free_list[4] 取出唯一的 16-page block
+
+  ┌─────────────────────────────────────────────────┐
+  │ 0   1   2   3   4   5   6   7  ···  15          │  ← 取出
+  └─────────────────────────────────────────────────┘
+
+Step 2: split 成兩個 8-page block
+
+  ┌───────────────────────┐  ┌───────────────────────┐
+  │ 0   1   2   3  4 5 6 7│  │ 8   9  10  11 ··· 15  │
+  └───────────────────────┘  └───────────────────────┘
+            ↓                          ↓
+         繼續切                  放回 free_list[3]
+
+Step 3: 左半再 split 成兩個 4-page block
+
+  ┌───────────┐  ┌───────────┐
+  │ 0  1  2  3│  │ 4  5  6  7│
+  └───────────┘  └───────────┘
+       ↓               ↓
+   分配給 A ✓     放回 free_list[2]
+```
+
+分配完的全域狀態：
+
+```
+free_list[4]:  (空)
+free_list[3]:  [ 8~15 ]
+free_list[2]:  [ 4~7  ]
+free_list[1]:  (空)
+free_list[0]:  (空)
+
+記憶體長這樣：
+  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+  │▓▓│▓▓│▓▓│▓▓│  │  │  │  │  │  │  │  │  │  │  │  │
+  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+
+   ▓▓ = A 佔用       (空白) = free
+```
+
+**再分配 B = 1 page（需要 order 0）：**
+
+`free_list[0]` 空 → `free_list[1]` 空 → `free_list[2]` 有 [4~7]，取出來切：
+
+```
+Step 1: 從 free_list[2] 取出 4~7，split
+
+  ┌───────────┐
+  │ 4  5  6  7│  ← 取出
+  └───────────┘
+        ↓ split
+  ┌─────┐  ┌─────┐
+  │ 4  5│  │ 6  7│
+  └─────┘  └─────┘
+    ↓         ↓
+  繼續切   放回 free_list[1]
+
+Step 2: 左半再 split
+
+  ┌──┐  ┌──┐
+  │ 4│  │ 5│
+  └──┘  └──┘
+   ↓      ↓
+  B ✓   放回 free_list[0]
+```
+
+現在的記憶體：
+
+```
+  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+  │▓▓│▓▓│▓▓│▓▓│██│  │  │  │  │  │  │  │  │  │  │  │
+  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+
+   ▓▓ = A        ██ = B        (空白) = free
+
+free_list[3]:  [ 8~15 ]
+free_list[1]:  [ 6~7  ]
+free_list[0]:  [ 5    ]
+```
+
+### 釋放：XOR 找 Buddy，往上合併
+
+釋放一個 block 時，檢查它的 buddy（同一個 parent 切出來的另一半）是不是也是 free 的。如果是，合併回 parent，然後繼續往上檢查。
+
+**怎麼找到 buddy？** 因為 block 大小都是 2 的冪次，buddy 的位址只差一個 bit：
+
+```
+公式：buddy 起始 frame = 自己的起始 frame XOR (1 << order)
+```
+
+例如 A 是 order 2（4 pages），起始 frame = 0：
+
+```
+buddy = 0 XOR (1 << 2)
+      = 0 XOR 4
+
+  0 的二進位：  000
+  4 的二進位：  100
+  XOR 結果：    100  = 4
+
+  → buddy 起始 frame = 4，也就是 Frame 4~7
+```
+
+反過來也成立，站在 Frame 4 的角度找 buddy：
+
+```
+buddy = 4 XOR (1 << 2)
+      = 4 XOR 4
+
+  4 的二進位：  100
+  4 的二進位：  100
+  XOR 結果：    000  = 0
+
+  → buddy 起始 frame = 0，也就是 Frame 0~3
+```
+
+XOR 之所以能做到，是因為 buddy system 永遠對半切，切的位置剛好對應二進位的某一個 bit：
+
+```
+order 0（1 page）：buddy 差在 bit 0
+  Frame 4 = 100
+  Frame 5 = 101   ← 翻轉 bit 0，互為 buddy。XOR 1
+
+order 1（2 pages）：buddy 差在 bit 1
+  Frame 4 = 100
+  Frame 6 = 110   ← 翻轉 bit 1，互為 buddy。XOR 2
+
+order 2（4 pages）：buddy 差在 bit 2
+  Frame 0 = 000
+  Frame 4 = 100   ← 翻轉 bit 2，互為 buddy。XOR 4
+```
+
+**釋放 A（Frame 0~3，order 2）：**
+
+```
+釋放 A，看它的 buddy 能不能合併：
+
+  A 的 buddy = 0 XOR (1<<2) = 0 XOR 4 = Frame 4
+  Frame 4 是 B，正在使用 → 不能合併
+
+  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+  │  │  │  │  │██│  │  │  │  │  │  │  │  │  │  │  │
+  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+   ╰─────────╯  ↑
+   放回 free     B 擋住，無法合併
+
+free_list[3]:  [ 8~15 ]
+free_list[2]:  [ 0~3  ]         ← A 放回這裡
+free_list[1]:  [ 6~7  ]
+free_list[0]:  [ 5    ]
+```
+
+**釋放 B（Frame 4，order 0）——連鎖合併：**
+
+```
+Round 1:  釋放 Frame 4（order 0）
+          buddy = 4 XOR (1<<0) = 4 XOR 1 = 5
+          Frame 5 free ✓ → 合併！
+
+          ┌──┬──┐
+          │ 4│ 5│ → 合成 order 1 block
+          └──┴──┘
+
+Round 2:  現在有 Frame 4~5（order 1）
+          buddy = 4 XOR (1<<1) = 4 XOR 2 = 6
+          Frame 6~7 free ✓ → 合併！
+
+          ┌──┬──┬──┬──┐
+          │ 4│ 5│ 6│ 7│ → 合成 order 2 block
+          └──┴──┴──┴──┘
+
+Round 3:  現在有 Frame 4~7（order 2）
+          buddy = 4 XOR (1<<2) = 4 XOR 4 = 0
+          Frame 0~3 free ✓ → 合併！
+
+          ┌──┬──┬──┬──┬──┬──┬──┬──┐
+          │ 0│ 1│ 2│ 3│ 4│ 5│ 6│ 7│ → 合成 order 3 block
+          └──┴──┴──┴──┴──┴──┴──┴──┘
+
+Round 4:  現在有 Frame 0~7（order 3）
+          buddy = 0 XOR (1<<3) = 0 XOR 8 = 8
+          Frame 8~15 free ✓ → 合併！
+
+          ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+          │ 0│ 1│ 2│ 3│ 4│ 5│ 6│ 7│ 8│ 9│..│..│..│..│..│15│
+          └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+          → 合成 order 4 block，完全還原
+
+free_list[4]:  [ 0~15 ]    ← 回到初始狀態
+```
+
+### struct page——Allocator 怎麼知道每個 block 的位置和大小
+
+Linux 在開機時，對每個 physical frame 建立一個 `struct page`，用陣列存：
+
+```
+Physical Memory:
+┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+│ 0│ 1│ 2│ 3│ 4│ 5│ 6│ 7│ 8│ 9│..│..│..│..│..│15│
+└──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+  │  │  │  │  │
+  ▼  ▼  ▼  ▼  ▼
+
+struct page 陣列（mem_map）：
+┌────────┬────────┬────────┬────────┬────────┬───
+│ page[0]│ page[1]│ page[2]│ page[3]│ page[4]│...
+│ order=2│        │        │        │ order=0│
+│ 是首頁  │        │        │        │ 是首頁  │
+└────────┴────────┴────────┴────────┴────────┴───
+```
+
+分配 A（Frame 0~3，order 2）時，在 `page[0]` 記下 `order = 2`。分配 B（Frame 4，order 0）時，在 `page[4]` 記下 `order = 0`。每次 split，parent 的 order 被覆蓋，兩個 child 的首頁各記自己的新 order：
+
+```
+初始：16-page block，order 4 記在 page[0]
+
+page:  [0]  [1]  [2]  [3]  [4]  [5]  [6]  [7] ... [15]
+order:  4    -    -    -    -    -    -    -        -
+
+Split 1:  order 4 → 兩個 order 3
+
+page:  [0]  [1]  [2]  [3]  [4]  [5]  [6]  [7]  [8] ... [15]
+order:  3    -    -    -    -    -    -    -    3       -
+        ╰──── 左半 ────╯                       ╰── 右半，放回 free_list[3]
+
+Split 2:  左半 order 3 → 兩個 order 2
+
+page:  [0]  [1]  [2]  [3]  [4]  [5]  [6]  [7]  [8] ... [15]
+order:  2    -    -    -    2    -    -    -    3       -
+        ╰─ A 分配出去 ─╯   ╰─ 放回 free_list[2] ╯
+```
+
+釋放時，`kmalloc` 回傳的 virtual address 可以直接反推 frame number（因為 kernel direct mapping 是固定偏移：`frame = (virtual_addr - PAGE_OFFSET) / 4096`），然後查 `page[frame].order` 就知道這個 block 的大小，再用 XOR 找 buddy，O(1) 完成。`struct page` 永遠只記當前這個 block 的 order，不記歷史——split 就改小，merge 就改大。
+
+### 為什麼能減少但無法消除 Fragmentation
+
+**能減少**：2 的冪次對齊讓合併判斷極快（一個 XOR），只要 buddy 都 free 就能一路合併回大 block，不會留下零碎的小空洞。
+
+**無法消除**：只要有一個 page 被佔住，它的 buddy 就無法合併，連鎖導致整條合併鏈斷掉：
+
+```
+16 pages 中只有 Frame 4 被佔住：
+
+  ┌──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+  │  │  │  │  │██│  │  │  │  │  │  │  │  │  │  │  │
+  └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+
+  5 想跟 4 合併？ → 4 occupied ✗
+    → 4~5 無法形成 → 4~7 無法形成 → 0~7 無法形成 → 0~15 無法形成
+
+  最大可用連續塊：
+  ┌──┬──┬──┬──┐  ┌──┐  ┌──┬──┐  ┌──┬──┬──┬──┬──┬──┬──┬──┐
+  │  │  │  │  │  │██│  │  │  │  │  │  │  │  │  │  │  │  │
+  └──┴──┴──┴──┘  └──┘  └──┴──┘  └──┴──┴──┴──┴──┴──┴──┴──┘
+   order 2 (4)    佔用   order 1   order 3 (8) ← 最大只有這塊
+
+  一個 page 卡在中間，最大連續塊從 16 降到 8
+```
+
+---
+
+## 44. 對抗 Kernel-Level Fragmentation
+
+Buddy system 無法消除 fragmentation 的根本原因是：一個被佔住的 page 會卡住整條合併鏈。Linux 在 buddy system 之上加了兩個機制來對抗。
+
+### Anti-Fragmentation Grouping——從源頭隔離
+
+把 physical page 分成三類，各自佔不同區域，避免互相卡住：
+
+```
+Physical Memory:
+┌──────────────────┬──────────────────┬──────────────────┐
+│   MOVABLE 區域    │  UNMOVABLE 區域   │ RECLAIMABLE 區域  │
+│  user process     │  kernel 內部結構   │  file cache       │
+│  可以搬走          │  搬不動           │  可以直接丟掉      │
+└──────────────────┴──────────────────┴──────────────────┘
+```
+
+Unmovable page 只會在自己的區域內佔位，不會跑到 movable 區域卡住別人的合併鏈。
+
+### Memory Compaction——強制搬走
+
+如果 movable 區域裡的 buddy 被佔住，OS 可以把那個 page 的內容搬到別的 frame，然後更新 page table 指向新位置：
+
+```
+搬之前：
+  ┌──┬──┬──┬──┐
+  │  │  │██│  │   ← Frame 2 擋住合併
+  └──┴──┴──┴──┘
+
+OS 把 Frame 2 的內容複製到別處，改 page table：
+  ┌──┬──┬──┬──┐
+  │  │  │  │  │   ← 四個都 free，可以合併成 order 2
+  └──┴──┴──┴──┘
+```
+
+但這只對 movable page 有效。Kernel 自己用的 unmovable page 搬不了——kernel direct mapping 是固定偏移，搬了 physical 位置就對不上了。
+
+### 根本限制
+
+Paging 不是消滅 fragmentation 的銀彈。它做的是把問題從致命降級為可管理：physical level fragmentation 被 MMU + page table 解決，大部分場景不再需要 physical 連續。但 heap allocator level 的 fragmentation 問題結構不變；跨 page 的性能損失是真實的（TLB miss、cache locality 下降）；真正需要 physical 連續的場景（DMA 等）fragmentation 問題依然存在；unmovable page 造成的 fragmentation 無解，只能靠隔離來降低影響。
+
+---
+
 # Part 10: 參考資料
 
 ---
 
-## 39. References
+## 45. References
 
 ### Intel 官方手冊
 
@@ -1830,3 +2424,27 @@ Physical memory 實際分散在 0x7000、0x2000、0xF000
 18. **Microsoft MASM .MODEL directive**
     - Memory model 的正式規格
     - https://learn.microsoft.com/en-us/cpp/assembler/masm/dot-model?view=msvc-170
+
+### Kernel 記憶體管理與 Buddy System 相關
+
+19. **Mel Gorman, *Understanding the Linux Virtual Memory Manager* (2004)**
+    - Chapter 6: Physical Page Allocation — Buddy allocator 的完整描述
+    - Chapter 10: Page Frame Reclaiming — Memory compaction 與 anti-fragmentation
+    - https://www.kernel.org/doc/gorman/html/understand/
+
+20. **Linux Kernel Source Code — Buddy System**
+    - `mm/page_alloc.c`: buddy allocator 核心實作（`__alloc_pages`、`__free_one_page`）
+    - `include/linux/mmzone.h`: `struct zone` 中的 `free_area[MAX_ORDER]` free list 定義
+    - `include/linux/mm_types.h`: `struct page` 定義（含 `private` 欄位存 order）
+
+21. **Linux Kernel Source Code — Memory Compaction**
+    - `mm/compaction.c`: memory compaction 實作
+    - `mm/migrate.c`: page migration（搬移 movable page）
+
+22. **Vlastimil Babka, "Memory Compaction" (2014)**
+    - Linux kernel memory compaction 的設計動機與 anti-fragmentation grouping（MOVABLE / UNMOVABLE / RECLAIMABLE）
+    - https://lwn.net/Articles/591998/
+
+23. **Jonathan Corbet, "A deep dive into CMA" (2012)**
+    - Contiguous Memory Allocator：啟動時預留連續區域給 DMA 使用
+    - https://lwn.net/Articles/486301/
