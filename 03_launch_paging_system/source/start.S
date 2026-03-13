@@ -109,9 +109,89 @@ _start_32:
      * Protected mode 的 flat model 下 base=0，所以 linear address = offset = physical address */
     mov esp, offset _start
 
-    /* 暫停：目前尚未實作 kernel entry point，避免 CPU fall through 到下方的 gdt_desc 資料
-     * gdt_desc 是資料不是指令，如果不停下來 CPU 會把它當指令執行 → 未定義行為 */
+    /* ====================================================================
+     * 啟用 Paging（PSE 4MB page）
+     *
+     * 正確順序：CR3 → CR4.PSE → CR0.PG
+     *   1. CR3:     告訴 CPU page directory 在哪
+     *   2. CR4.PSE: 讓 CPU 認得 PDE 的 PS bit（4MB page）
+     *   3. CR0.PG:  最後才開啟 paging
+     *
+     * 如果先開 PG 再設 PSE，CPU 會把 PDE 的 PS bit 忽略，
+     * 將 PDE 當成 page table pointer → 指向垃圾地址 → triple fault
+     * ==================================================================== */
+
+    /* Step 1: 載入 Page Directory 的 physical address 到 CR3
+     *
+     * CR3（Page Directory Base Register, PDBR）：
+     *
+     *   31                           12 11  5 4  3  2  0
+     *   ┌──────────────────────────────┬──────┬───┬───┬──────┐
+     *   │  Page Directory Base [31:12] │ 保留  │PCD│PWT│ 保留  │
+     *   └──────────────────────────────┴──────┴───┴───┴──────┘
+     *
+     *   Base [31:12]: page directory 的 physical address（必須 4KB 對齊，低 12 bits = 0）
+     *   PCD (bit 4):  Page-level Cache Disable（0 = 允許 cache）
+     *   PWT (bit 3):  Page-level Write-Through（0 = write-back）
+     *
+     *   page_dir 在 os.c 中用 __attribute__((aligned(4096))) 宣告，保證 4KB 對齊
+     */
+    mov eax, offset page_dir
+    mov cr3, eax
+
+    /* Step 2: 啟用 CR4.PSE（Page Size Extension）
+     *
+     * CR4：
+     *
+     *   31         8  7  6  5  4  3  2  1  0
+     *   ┌──────────┬──┬──┬──┬───┬───┬──┬───┬───┐
+     *   │  其他     │  │  │  │PSE│PAE│  │   │   │
+     *   └──────────┴──┴──┴──┴───┴───┴──┴───┴───┘
+     *
+     *   PSE (bit 4): Page Size Extension
+     *     0 = PDE 只能指向 page table（4KB page）
+     *     1 = PDE 的 PS bit（bit 7）有效：PS=1 表示 4MB page，PS=0 表示指向 page table，代表只有4mb的空間映射
+     *
+     *   PAE (bit 5): Physical Address Extension
+     *     0 = 32-bit physical address（最大 4GB）
+     *     1 = 36-bit physical address（最大 64GB），page table entry 變 64-bit
+     *
+     *   這裡只開 PSE，使用 4MB page 做 identity mapping
+     */
+    mov eax, cr4
+    or  eax, (1 << 4)
+    mov cr4, eax
+
+    /* Step 3: 啟用 CR0.PG（Paging）
+     *
+     * CR0：
+     *
+     *   31  30  29             18  16  5  4  3  2  1  0
+     *   ┌───┬──┬───┬──────────┬───┬───┬──┬──┬──┬──┬──┬──┐
+     *   │PG │CD│NW │   ...    │AM │WP │  │  │  │  │  │PE│
+     *   └───┴──┴───┴──────────┴───┴───┴──┴──┴──┴──┴──┴──┘
+     *
+     *   PE (bit 0):  Protection Enable（已在上面設為 1，進入 protected mode）
+     *   WP (bit 16): Write Protect（1 = ring 0 也不能寫 read-only page）
+     *   AM (bit 18): Alignment Mask
+     *   NW (bit 29): Not Write-through
+     *   CD (bit 30): Cache Disable
+     *   PG (bit 31): Paging Enable
+     *     0 = linear address = physical address（不經過 page table）
+     *     1 = linear address 經過 page table 翻譯為 physical address
+     *
+     *   PG=1 的前提：PE 必須已經是 1（不能在 real mode 開 paging）
+     *   啟用瞬間，CPU 用 CR3 指向的 page directory 翻譯下一條指令的地址
+     *   如果翻譯失敗（mapping 不正確）→ page fault → 無 IDT → triple fault
+     */
+    mov eax, cr0
+    or  eax, (1 << 31)
+    mov cr0, eax
+
     jmp .
+
+
+
 
 
 /* GDT Descriptor（GDTR 的內容）

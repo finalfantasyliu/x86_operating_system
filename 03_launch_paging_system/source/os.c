@@ -120,3 +120,53 @@ struct {
     /* Entry 2 (selector 0x10): Kernel Data Segment — base=0, limit=4GB, read/write, ring 0 */
     [KERNEL_DATA_SEG / 8] = {0xffff, 0x0000, 0x9200, 0x00cf},
 };
+/*
+ * Page Directory Entry (PDE) flags
+ *
+ * 當 CR4.PSE=1 且 PDE.PS=1 時，PDE 直接映射 4MB page（不經過 page table）：
+ *
+ *   31              22 21       13 12 11    9 8  7  6  5  4  3  2  1  0
+ *   ┌─────────────────┬──────────┬──┬───────┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+ *   │ Base [31:22]     │ 保留(0)  │PAT│ Avail │G │PS│D │A │CD│WT│U │W │P │
+ *   └─────────────────┴──────────┴──┴───────┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+ *
+ *   P  (bit 0): Present — 1 = page 在記憶體中
+ *   W  (bit 1): Read/Write — 1 = 可寫
+ *   U  (bit 2): User/Supervisor — 1 = ring 3 可存取
+ *   WT (bit 3): Write-Through — 1 = write-through cache
+ *   CD (bit 4): Cache Disable — 1 = 不 cache
+ *   A  (bit 5): Accessed — CPU 存取過時自動設為 1
+ *   D  (bit 6): Dirty — CPU 寫過時自動設為 1
+ *   PS (bit 7): Page Size — 1 = 4MB page（需 CR4.PSE=1），0 = 指向 page table
+ *   G  (bit 8): Global — 1 = CR3 切換時不 flush 此 TLB entry
+ *   Base [31:22]: 4MB page 的 physical base address（必須 4MB 對齊，低 22 bits = 0）
+ */
+#define PDE_P   (1 << 0)
+#define PDE_W   (1 << 1)
+#define PDE_U   (1 << 2)
+#define PDE_PS  (1 << 7)
+
+/*
+ * Page Directory — 1024 entries，每個管 4MB，共覆蓋 4GB
+ *
+ * 目前只設定 entry[0]：identity map 前 4MB（virtual 0~4MB = physical 0~4MB）
+ *
+ *   entry[0] = 0x00000000 | PDE_P | PDE_W | PDE_U | PDE_PS
+ *            = 0x00000087
+ *
+ *   Base [31:22] = 0x000 → physical base = 0x00000000
+ *   PS=1 → 4MB page（不查 page table）
+ *   P=1, W=1, U=1 → present, writable, user-accessible
+ *
+ *   映射結果：
+ *     virtual  0x00000000 ~ 0x003FFFFF  →  physical 0x00000000 ~ 0x003FFFFF
+ *     （涵蓋 0x7C00 boot code 所在位置，所以開啟 paging 後程式繼續正常執行）
+ *
+ *   entry[1~1023] = 0 → P=0，存取這些範圍會觸發 page fault
+ *
+ * aligned(4096)：page directory 必須 4KB（0x1000）對齊，
+ * 因為 CR3 只取 bits[31:12] 當 base address，低 12 bits 是 flags/reserved
+ */
+uint32_t page_dir[1024] __attribute__((aligned(4096))) = {
+    [0] = (0) | PDE_P | PDE_W | PDE_U | PDE_PS,
+};
